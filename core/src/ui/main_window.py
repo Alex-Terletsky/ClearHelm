@@ -470,18 +470,26 @@ class MainWindow(QMainWindow):
         Returns True if any content was rendered, False if all segments
         were filtered out by the current log mode.
         """
-        prev_skipped = False
-        rendered = False
+        parts = []
         for part in _COMBINED_RE.split(text):
             if not part:
                 continue
             kind, content = _parse_segment(part)
-            if self._should_skip(kind):
+            parts.append((kind, content, self._should_skip(kind)))
+
+        prev_skipped = False
+        rendered = False
+        for i, (kind, content, skip) in enumerate(parts):
+            if skip:
                 prev_skipped = True
                 continue
             if prev_skipped:
                 content = content.lstrip('\n')
                 prev_skipped = False
+            if (not content.strip('\n')
+                    and i + 1 < len(parts) and parts[i + 1][2]):
+                prev_skipped = True
+                continue
             if not content:
                 continue
             self._insert_formatted(cursor, content, kind, agent_color=agent_color)
