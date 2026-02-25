@@ -1,6 +1,6 @@
 # ClearHelm
 
-A multithreaded local LLM runner built for deep visibility into model behavior, parameters, and performance. ClearHelm provides full access and control over locally run AI models with fully exposed live parameter configuration, beam search for alternate generation paths, and custom output interception to allow for multi-agent orchestration and communication. Alongside the ability to save agent and parameter configurations to the application for rapid testing, ClearHelm also has a module system that allows for custom integrations of model behaviour and output, such as the ability to run scripts based on structured agent output.
+A multithreaded local LLM runner built for deep visibility into model behavior, parameters, and performance. ClearHelm provides full access and control over locally run AI models with fully exposed live parameter configuration, beam search for alternate generation paths, and custom output interception to enable multi-agent orchestration and communication. Alongside the ability to save agent and parameter configurations to the application for rapid testing, ClearHelm also has a module system that allows for custom integrations of model behaviour and output, such as the ability to run scripts based on structured agent output.
 
 <table><tr>
 <td><img src="images/flow-1.png" width="600"/></td>
