@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Model files
+models/*.gguf
+models/.cache/
+
+# Agent files
+agents/*.json
+
+# Hide .vscode
+.vscode/
