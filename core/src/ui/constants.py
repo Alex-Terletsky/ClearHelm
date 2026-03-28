@@ -15,6 +15,7 @@ _CONFIGS_DIR = os.path.join(_PROJECT_ROOT, "configs")
 _CONFIG_PATH = os.path.join(_PROJECT_ROOT, "runner_config.json")
 _AGENTS_DIR  = os.path.join(_PROJECT_ROOT, "agents")
 _MODULES_DIR = os.path.join(_PROJECT_ROOT, "modules")
+_TEMPLATES_DIR = os.path.join(_PROJECT_ROOT, "templates")
 
 
 # ---- Status badge colors ----

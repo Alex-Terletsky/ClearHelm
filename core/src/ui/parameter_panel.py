@@ -4,12 +4,20 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QFormLayout, QHBoxLayout,
     QLabel, QCheckBox, QGroupBox, QSpinBox, QDoubleSpinBox, QLineEdit,
+    QTextEdit, QComboBox,
 )
 
-from params import PARAMETER_GROUPS, RunnerConfig
+from params import PARAMETER_GROUPS, ModuleParam, InterceptableCommand, RunnerConfig
 from runner import ServiceState
+from chat_format import discover_templates
 
-from .widgets import NoScrollSpinBox, NoScrollDoubleSpinBox
+from .constants import _TEMPLATES_DIR
+from .widgets import NoScrollSpinBox, NoScrollDoubleSpinBox, NoScrollComboBox
+
+_MODULE_HEADER_STYLE = (
+    "font-weight: bold; color: #a6e3a1; "
+    "margin-top: 8px; margin-bottom: 2px;"
+)
 
 
 class ParameterPanel(QWidget):
@@ -23,6 +31,11 @@ class ParameterPanel(QWidget):
         self._checkboxes: dict[str, QCheckBox] = {}
         self._model_state: ServiceState | None = None
         self._original_loading: dict[str, object] = {}
+        self._module_schemas: dict[str, list[ModuleParam]] = {}
+        self._module_param_widgets: dict[str, dict[str, QWidget]] = {}
+        self._module_access_widgets: dict[str, QCheckBox] = {}
+        self._intercept_schemas: dict[str, list[InterceptableCommand]] = {}
+        self._intercept_widgets: dict[str, dict[str, QCheckBox]] = {}
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -131,6 +144,9 @@ class ParameterPanel(QWidget):
     def _clear_detail(self):
         self._param_widgets.clear()
         self._warn_labels.clear()
+        self._module_param_widgets.clear()
+        self._module_access_widgets.clear()
+        self._intercept_widgets.clear()
         while self._detail_layout.count():
             child = self._detail_layout.takeAt(0)
             w = child.widget()
@@ -193,26 +209,65 @@ class ParameterPanel(QWidget):
             else:
                 self._detail_layout.addRow(f"{pname}:", widget)
 
-    def _make_editor(self, pname: str, value) -> QWidget:
+        # Module access + config + intercept sections
+        self._rebuild_module_access(cfg)
+        self._rebuild_module_config(cfg)
+        self._rebuild_module_intercept(cfg)
+
+    def _create_widget(self, pname: str, value) -> QWidget:
+        """Build a widget for *pname*/*value* without connecting signals."""
+        if pname == "chat_template":
+            w = NoScrollComboBox()
+            w.addItem("none")
+            for t in discover_templates(_TEMPLATES_DIR):
+                w.addItem(t["name"])
+            w.setCurrentText(str(value))
+            return w
+        if pname == "system_prompt":
+            w = QTextEdit()
+            w.setPlainText(str(value) if value else "")
+            w.setFixedHeight(80)
+            return w
         if isinstance(value, bool):
             w = QCheckBox()
             w.setChecked(value)
-            w.stateChanged.connect(lambda state, n=pname: self._on_param_changed(n))
         elif isinstance(value, int):
             w = NoScrollSpinBox()
             w.setRange(-1, 999999)
             w.setValue(value)
-            w.valueChanged.connect(lambda v, n=pname: self._on_param_changed(n))
         elif isinstance(value, float):
             w = NoScrollDoubleSpinBox()
             w.setRange(-1.0, 999999.0)
             w.setDecimals(4)
             w.setSingleStep(0.01)
             w.setValue(value)
-            w.valueChanged.connect(lambda v, n=pname: self._on_param_changed(n))
         else:
             w = QLineEdit(str(value) if value is not None else "")
-            w.editingFinished.connect(lambda n=pname: self._on_param_changed(n))
+        return w
+
+    @staticmethod
+    def _connect_widget_signal(w: QWidget, callback):
+        """Connect the appropriate change signal on *w* to *callback*."""
+        if isinstance(w, QComboBox):
+            w.currentTextChanged.connect(lambda _v: callback())
+        elif isinstance(w, QTextEdit):
+            w.textChanged.connect(callback)
+        elif isinstance(w, QCheckBox):
+            w.stateChanged.connect(lambda _s: callback())
+        elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+            w.valueChanged.connect(lambda _v: callback())
+        elif isinstance(w, QLineEdit):
+            w.editingFinished.connect(callback)
+
+    def _make_editor(self, pname: str, value) -> QWidget:
+        w = self._create_widget(pname, value)
+        self._connect_widget_signal(w, lambda n=pname: self._on_param_changed(n))
+        return w
+
+    def _make_module_editor(self, mod_name: str, param_name: str, value) -> QWidget:
+        w = self._create_widget(param_name, value)
+        self._connect_widget_signal(
+            w, lambda m=mod_name, p=param_name: self._on_module_param_changed(m, p))
         return w
 
     def _on_param_changed(self, pname: str):
@@ -233,7 +288,11 @@ class ParameterPanel(QWidget):
 
         old = getattr(target, pname)
 
-        if isinstance(widget, QCheckBox):
+        if isinstance(widget, QComboBox):
+            setattr(target, pname, widget.currentText())
+        elif isinstance(widget, QTextEdit):
+            setattr(target, pname, widget.toPlainText())
+        elif isinstance(widget, QCheckBox):
             setattr(target, pname, widget.isChecked())
         elif isinstance(widget, QSpinBox):
             setattr(target, pname, widget.value())
@@ -252,3 +311,113 @@ class ParameterPanel(QWidget):
                 setattr(target, pname, text)
 
         self._update_warn_label(pname)
+
+    # ---- Module schemas / access / config ----
+
+    def set_module_schemas(self, schemas: dict[str, list]):
+        """Called once after module load to register available schemas."""
+        self._module_schemas = schemas
+
+    def _read_widget_value(self, widget: QWidget):
+        """Extract the current value from a widget."""
+        if isinstance(widget, QComboBox):
+            return widget.currentText()
+        if isinstance(widget, QTextEdit):
+            return widget.toPlainText()
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        if isinstance(widget, (QSpinBox, QDoubleSpinBox)):
+            return widget.value()
+        if isinstance(widget, QLineEdit):
+            return widget.text()
+        return None
+
+    def _add_module_header(self, text: str):
+        sep = QLabel(text)
+        sep.setStyleSheet(_MODULE_HEADER_STYLE)
+        self._detail_layout.addRow(sep)
+
+    def _rebuild_module_access(self, cfg: RunnerConfig):
+        """Render a 'Module Access' section with a checkbox per installed module."""
+        if not self._module_schemas:
+            return
+        self._add_module_header("[module] Access")
+        for mod_name in self._module_schemas:
+            cb = QCheckBox()
+            enabled = cfg.module_access.get(mod_name, False)
+            cb.setChecked(enabled)
+            cb.stateChanged.connect(
+                lambda state, m=mod_name: self._on_module_access_changed(m, state))
+            self._module_access_widgets[mod_name] = cb
+            self._detail_layout.addRow(f"{mod_name}:", cb)
+
+    def _rebuild_module_config(self, cfg: RunnerConfig):
+        """Render config fields for each installed module that has a schema."""
+        for mod_name, params in self._module_schemas.items():
+            if not params:
+                continue
+            if not cfg.module_access.get(mod_name, False):
+                continue
+            self._add_module_header(f"[module] {mod_name}")
+            mod_cfg = cfg.module_config.get(mod_name, {})
+            widgets: dict[str, QWidget] = {}
+            for p in params:
+                value = mod_cfg.get(p.name, p.default)
+                w = self._make_module_editor(mod_name, p.name, value)
+                widgets[p.name] = w
+                self._detail_layout.addRow(f"{p.name}:", w)
+            self._module_param_widgets[mod_name] = widgets
+
+    def _on_module_access_changed(self, module_name: str, state: int):
+        cfg = self._current_config
+        if cfg is None:
+            return
+        cfg.module_access[module_name] = bool(state)
+        self._rebuild_detail()
+
+    def _on_module_param_changed(self, mod_name: str, param_name: str):
+        cfg = self._current_config
+        if cfg is None:
+            return
+        widgets = self._module_param_widgets.get(mod_name, {})
+        widget = widgets.get(param_name)
+        if widget is None:
+            return
+        value = self._read_widget_value(widget)
+        cfg.module_config.setdefault(mod_name, {})[param_name] = value
+
+    # ---- Intercept schemas / toggles ----
+
+    def set_intercept_schemas(self, schemas: dict[str, list]):
+        """Called once after module load to register intercept schemas."""
+        self._intercept_schemas = schemas
+
+    def _rebuild_module_intercept(self, cfg: RunnerConfig):
+        """Render intercept toggles for each enabled module with an intercept schema."""
+        for mod_name, commands in self._intercept_schemas.items():
+            if not commands:
+                continue
+            if not cfg.module_access.get(mod_name, False):
+                continue
+            self._add_module_header(f"[module] {mod_name} — intercepts")
+            mod_intercept = cfg.module_intercept.get(mod_name, {})
+            widgets: dict[str, QCheckBox] = {}
+            for cmd in commands:
+                cb = QCheckBox()
+                checked = mod_intercept.get(cmd.name, cmd.intercept)
+                cb.setChecked(checked)
+                cb.stateChanged.connect(
+                    lambda state, m=mod_name, c=cmd.name:
+                        self._on_intercept_changed(m, c, state))
+                widgets[cmd.name] = cb
+                label = cmd.name
+                if cmd.description:
+                    label = f"{cmd.name} ({cmd.description})"
+                self._detail_layout.addRow(f"{label}:", cb)
+            self._intercept_widgets[mod_name] = widgets
+
+    def _on_intercept_changed(self, module_name: str, command_name: str, state: int):
+        cfg = self._current_config
+        if cfg is None:
+            return
+        cfg.module_intercept.setdefault(module_name, {})[command_name] = bool(state)

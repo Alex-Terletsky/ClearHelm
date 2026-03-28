@@ -26,6 +26,7 @@ from .widgets import SignalBridge, NoScrollComboBox
 from .agents import _load_agent_configs, _save_agent_config, _delete_agent_config
 from .sidebar import ModelSidebar
 from .parameter_panel import ParameterPanel
+from .module_panel import ModulePanel
 from .dialogs import AddAgentDialog
 
 
@@ -118,6 +119,12 @@ class MainWindow(QMainWindow):
             "QPushButton:checked { color: #cdd6f4; border-color: #cdd6f4; }"
             "QPushButton:hover { color: #cdd6f4; }"
         )
+        _drawer_btn_style = (
+            "QPushButton { background-color: transparent; color: #6c7086; "
+            "border: 1px solid #45475a; border-radius: 3px; padding: 0 10px; font-size: 12px; }"
+            "QPushButton:checked { color: #89b4fa; border-color: #89b4fa; }"
+            "QPushButton:hover { color: #cdd6f4; }"
+        )
         self._btn_output  = QPushButton("Output")
         self._btn_basic   = QPushButton("Basic Logs")
         self._btn_verbose = QPushButton("Verbose Logs")
@@ -130,13 +137,22 @@ class MainWindow(QMainWindow):
             self._log_btn_group.addButton(btn, i)
         self._btn_output.setChecked(True)
 
+        self._btn_drawer = QPushButton("\u2630")
+        self._btn_drawer.setCheckable(True)
+        self._btn_drawer.setChecked(False)
+        self._btn_drawer.setFixedHeight(22)
+        self._btn_drawer.setToolTip("Toggle Actions panel")
+        self._btn_drawer.setStyleSheet(_drawer_btn_style)
+
         console_row = QHBoxLayout()
         console_row.setContentsMargins(0, 0, 0, 0)
         console_row.setSpacing(4)
-        console_row.addStretch()
         console_row.addWidget(self._btn_output)
         console_row.addWidget(self._btn_basic)
         console_row.addWidget(self._btn_verbose)
+        console_row.addStretch()
+        console_row.addWidget(self._btn_drawer)
+        console_row.addSpacing(4)
         console_layout.addLayout(console_row)
 
         console_layout.addWidget(self._output, stretch=1)
@@ -169,9 +185,19 @@ class MainWindow(QMainWindow):
         param_layout.addStretch()
         param_scroll.setWidget(param_widget)
 
-        # Splitter: console panel (output+input+verbose) vs. param panel
+        # Module interception panel (collapsible, right of console)
+        self._module_panel = ModulePanel()
+
+        self._console_split = QSplitter(Qt.Horizontal)
+        self._console_split.addWidget(console_panel)
+        self._console_split.addWidget(self._module_panel)
+        self._console_split.setStretchFactor(0, 1)   # console gets all space
+        self._console_split.setStretchFactor(1, 0)   # module panel natural width
+        self._console_split.setCollapsible(1, False)  # only collapse via drawer button
+
+        # Splitter: console area (output+input+verbose+module panel) vs. param panel
         v_split = QSplitter(Qt.Vertical)
-        v_split.addWidget(console_panel)
+        v_split.addWidget(self._console_split)
         v_split.addWidget(param_scroll)
         v_split.setStretchFactor(0, 3)
         v_split.setStretchFactor(1, 1)
@@ -195,6 +221,9 @@ class MainWindow(QMainWindow):
         self._btn_load_config.clicked.connect(self._load_config_file)
         self._btn_save_config.clicked.connect(self._save_config)
         self._log_btn_group.idClicked.connect(self._on_log_mode_changed)
+        self._btn_drawer.clicked.connect(self._on_drawer_toggled)
+        self._module_panel.badge_changed.connect(self._on_badge_changed)
+        self._module_panel.expanded_changed.connect(self._btn_drawer.setChecked)
 
         # ---- Status poll timer ----
         self._timer = QTimer(self)
@@ -215,12 +244,65 @@ class MainWindow(QMainWindow):
             get_agent_names_fn=lambda: self._manager.model_names,
             ready_models_fn=self._manager.ready_models,
             emit_fn=lambda text: self._manager_output("system", text),
+            get_module_config_fn=self._get_module_config,
+            set_module_config_fn=self._set_module_config,
+            request_action_fn=self._on_action_requested,
         )
-        self._module_manager = ModuleManager(_MODULES_DIR, _ctx)
+        self._module_manager = ModuleManager(
+            _MODULES_DIR, _ctx,
+            get_agent_config_fn=self._get_agent_config,
+        )
         self._module_manager.load_all()
+        self._param_panel.set_module_schemas(self._module_manager.module_schemas)
+        self._param_panel.set_intercept_schemas(self._module_manager.intercept_schemas)
 
         # Initialise the "All" view state now that signals are connected and agents loaded
         self._on_active_changed(self._active_combo.currentText())
+
+    # ---- Module config helpers ----
+
+    def _get_agent_config(self, agent_name: str):
+        """Return the RunnerConfig for *agent_name*, or None."""
+        try:
+            return self._manager.get_config(agent_name)
+        except KeyError:
+            return None
+
+    def _active_agent_name(self) -> str | None:
+        """Return the name of the agent currently targeted for interaction."""
+        current = self._active_combo.currentText()
+        return self._last_individual if current == "All" else (current or None)
+
+    def _get_module_config(self, module_name: str) -> dict:
+        """Read the active agent's config for *module_name*, with defaults merged."""
+        agent = self._active_agent_name()
+        if not agent:
+            return {}
+        cfg = self._get_agent_config(agent)
+        if cfg is None:
+            return {}
+        merged = dict(cfg.module_config.get(module_name, {}))
+        schemas = self._module_manager.module_schemas
+        for p in schemas.get(module_name, []):
+            merged.setdefault(p.name, p.default)
+        return merged
+
+    def _set_module_config(self, module_name: str, key: str, value):
+        """Write a single key into the active agent's module config."""
+        agent = self._active_agent_name()
+        if not agent:
+            return
+        cfg = self._get_agent_config(agent)
+        if cfg is None:
+            return
+        cfg.module_config.setdefault(module_name, {})[key] = value
+
+    def _on_action_requested(self, module_name, command_name, agent_name,
+                             description, action, on_deny):
+        """Route an intercepted module action to the module panel."""
+        self._module_panel.add_request(
+            module_name, command_name, agent_name,
+            description, action, on_deny)
 
     # ---- Chat combo helpers ----
 
@@ -280,7 +362,9 @@ class MainWindow(QMainWindow):
             config = load_config(self._manager.config_path, model_path=model["path"])
         config.model_name = name
 
-        _save_agent_config(config)
+        _save_agent_config(config,
+                          module_schemas=self._module_manager.module_schemas,
+                          intercept_schemas=self._module_manager.intercept_schemas)
         self._manager.add_model(name, model["path"], config=config)
         self._histories[name] = ""
         self._sidebar.add_agent(name)
@@ -296,6 +380,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         _delete_agent_config(name)
+        self._module_panel.remove_requests_for_agent(name)
         self._manager.remove_model(name)
         self._sidebar.remove_agent(name)
         self._histories.pop(name, None)
@@ -309,7 +394,9 @@ class MainWindow(QMainWindow):
     def _save_agent(self, name: str):
         try:
             cfg = self._manager.get_config(name)
-            _save_agent_config(cfg)
+            _save_agent_config(cfg,
+                              module_schemas=self._module_manager.module_schemas,
+                              intercept_schemas=self._module_manager.intercept_schemas)
         except KeyError:
             pass
 
@@ -346,6 +433,9 @@ class MainWindow(QMainWindow):
             cfg.active_groups      = new_cfg.active_groups
             cfg.model_config       = new_cfg.model_config
             cfg.generation_config  = new_cfg.generation_config
+            cfg.module_config      = new_cfg.module_config
+            cfg.module_access      = new_cfg.module_access
+            cfg.module_intercept   = new_cfg.module_intercept
             cfg.model_name         = saved_name
             self._param_panel.set_config(cfg)
         except Exception as e:
@@ -376,7 +466,9 @@ class MainWindow(QMainWindow):
                 self, "Save Config", default_path, "JSON Files (*.json)"
             )
             if path:
-                cfg.to_file(path)
+                cfg.to_file(path,
+                            module_schemas=self._module_manager.module_schemas,
+                            intercept_schemas=self._module_manager.intercept_schemas)
                 self._populate_presets()  # refresh list if saved to configs dir
         except Exception as e:
             QMessageBox.warning(self, "Save Error", str(e))
@@ -393,6 +485,7 @@ class MainWindow(QMainWindow):
         state = self._manager.get_state(name)
         if state in (ServiceState.IDLE, ServiceState.STOPPING):
             return
+        self._module_panel.remove_requests_for_agent(name)
         self._manager.stop_model(name)
 
     # ---- Active model switching ----
@@ -421,10 +514,14 @@ class MainWindow(QMainWindow):
             self._param_panel.set_config(None)
             self._param_panel.set_state(None)
             self._param_model = None
+            self._module_manager.set_target_agent(self._last_individual or None)
+            self._module_panel.set_agent_filter(None)
             return
         # Individual agent
         self._last_individual = name
         self._input.setPlaceholderText("Enter prompt...")
+        self._module_manager.set_target_agent(name)
+        self._module_panel.set_agent_filter(name)
         try:
             self._manager.set_active(name)
         except KeyError:
@@ -525,6 +622,24 @@ class MainWindow(QMainWindow):
         elif active:
             self._reload_output(active)
 
+    def _on_drawer_toggled(self):
+        expanded = self._btn_drawer.isChecked()
+        if not expanded:
+            self._drawer_saved_sizes = self._console_split.sizes()
+        self._module_panel.set_expanded(expanded)
+        if expanded and hasattr(self, '_drawer_saved_sizes'):
+            self._console_split.setSizes(self._drawer_saved_sizes)
+        elif not expanded:
+            self._console_split.setSizes([sum(self._drawer_saved_sizes), 0])
+
+    def _on_badge_changed(self, count: int):
+        if count > 0:
+            self._btn_drawer.setText(f"\u2630 ({count})")
+            self._btn_drawer.setToolTip(f"Toggle Actions panel ({count} pending)")
+        else:
+            self._btn_drawer.setText("\u2630")
+            self._btn_drawer.setToolTip("Toggle Actions panel")
+
     def _manager_output(self, model_name: str, text: str):
         self._bridge.text_received.emit(model_name, text)
 
@@ -605,6 +720,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._timer.stop()
+        self._module_panel.clear_requests()
         self._manager.shutdown()
         self._module_manager.shutdown()
         event.accept()

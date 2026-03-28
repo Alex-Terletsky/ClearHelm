@@ -12,13 +12,7 @@ Demonstrates two features:
 import re
 
 from module_manager import Module, ModuleContext
-
-# Maximum chars kept per-agent in the rolling lookahead buffer.
-_BUFFER_MAX = 4096
-
-# Maximum routed messages triggered by a single user action before we stop.
-# Prevents runaway agent-to-agent loops.
-_MAX_ROUTES = 10
+from params import ModuleParam, InterceptableCommand
 
 _TOOLCALL_RE = re.compile(
     r'<toolcall>\s*message_agent\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)\s*</toolcall>',
@@ -27,32 +21,59 @@ _TOOLCALL_RE = re.compile(
 
 
 class MessageAgentModule(Module):
+    NAME = "message_agent"
+    CONFIG_SCHEMA = [
+        ModuleParam("buffer_max", int, 4096, "Max chars in lookahead buffer"),
+        ModuleParam("max_routes", int, 10, "Max routed messages per user action"),
+    ]
+    INTERCEPT_SCHEMA = [
+        InterceptableCommand("route_message", "Route a message to another agent", intercept=True),
+    ]
+
     def on_load(self, ctx: ModuleContext):
         self._ctx = ctx
         self._buffers: dict[str, str] = {}
         self._route_count = 0
         ctx.emit("[message_agent] Module loaded.\n")
 
+    def _get_cfg(self) -> dict:
+        return self._ctx.get_config("message_agent")
+
     def _route(self, source: str, target: str, message: str):
-        if self._route_count >= _MAX_ROUTES:
+        max_routes = self._get_cfg().get("max_routes", 10)
+        if self._route_count >= max_routes:
             self._ctx.emit(
-                f"[message_agent] Route limit ({_MAX_ROUTES}) reached — suppressed."
+                f"[message_agent] Route limit ({max_routes}) reached — suppressed."
             )
             return
-        self._route_count += 1
-        self._ctx.emit(
-            f"[message_agent] Routing from '{source}' → '{target}': {message!r}"
-        )
-        self._ctx.message_agent(target, message)
+
+        desc = f"Route from '{source}' to '{target}': {message!r}"
+
+        def do_route():
+            # Re-validate at execution time (state may have changed since request)
+            if self._route_count >= self._get_cfg().get("max_routes", 10):
+                self._ctx.emit("[message_agent] Route limit reached — blocked.")
+                return
+            self._route_count += 1
+            self._ctx.emit(
+                f"[message_agent] Routing from '{source}' → '{target}': {message!r}"
+            )
+            self._ctx.message_agent(target, message)
+
+        self._ctx.request_action(
+            "route_message", source, desc,
+            action=do_route,
+            on_deny=lambda: self._ctx.emit("[message_agent] Route blocked by user."))
 
     def on_output(self, model_name: str, text: str):
         # Skip log lines emitted by ctx.emit() itself
         if model_name == "system":
             return
 
+        buffer_max = self._get_cfg().get("buffer_max", 4096)
         buf = self._buffers.get(model_name, "") + text
-        if len(buf) > _BUFFER_MAX:
-            buf = buf[-_BUFFER_MAX:]
+        if len(buf) > buffer_max:
+            buf = buf[-buffer_max:]
 
         offset = 0
         for m in _TOOLCALL_RE.finditer(buf):

@@ -19,9 +19,12 @@ def _load_agent_configs() -> list[RunnerConfig]:
     return configs
 
 
-def _save_agent_config(cfg: RunnerConfig):
+def _save_agent_config(cfg: RunnerConfig, module_schemas: dict | None = None,
+                       intercept_schemas: dict | None = None):
     os.makedirs(_AGENTS_DIR, exist_ok=True)
-    cfg.to_file(os.path.join(_AGENTS_DIR, f"{cfg.model_name}.json"))
+    cfg.to_file(os.path.join(_AGENTS_DIR, f"{cfg.model_name}.json"),
+                module_schemas=module_schemas,
+                intercept_schemas=intercept_schemas)
 
 
 def _delete_agent_config(name: str):

@@ -289,6 +289,9 @@ MODULE_CLASS = MyModule
 | `ctx.message_agent(name, message)` | Submit a prompt to a named agent's queue |
 | `ctx.get_agent_names()` | List all registered agents |
 | `ctx.get_ready_agents()` | List agents currently in `READY` state |
+| `ctx.get_config(module_name)` | Return the current agent's config for the module (context-aware — reads from source agent during `on_output`, active agent during `on_user_input`) |
+| `ctx.set_config(module_name, key, value)` | Write a single key into the active agent's module config |
+| `ctx.request_action(command, agent, desc, action, on_deny)` | Request an interceptable action — shows in the actions panel for user approval if interception is enabled |
 
 ### Included module: `message_agent`
 
@@ -298,7 +301,7 @@ Enables agents to route messages to each other by outputting a toolcall tag anyw
 <toolcall>message_agent("TargetAgent", "your message")</toolcall>
 ```
 
-When the tag is detected in an agent's output stream, the message is submitted to the named agent's prompt queue. A maximum of 10 routed messages are allowed per user action to prevent runaway loops; the counter resets on each new user prompt.
+When the tag is detected in an agent's output stream, routing is subject to interception — if enabled for that agent, a request card appears in the actions panel (☰) for user approval before the message is sent. If interception is off, the message routes immediately. Interception is controlled per-agent via `module_intercept` in the agent's JSON config. A maximum of 10 routed messages are allowed per user action to prevent runaway loops; the counter resets on each new user prompt.
 
 Type `!test_route` in the input field to send a test message to the first available READY agent and confirm the routing pipeline is working.
 

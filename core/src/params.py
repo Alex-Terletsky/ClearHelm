@@ -7,7 +7,24 @@ ParameterVisibility (active-parameter logging).
 
 import json
 from dataclasses import dataclass, field, fields
-from typing import Callable
+from typing import Callable, NamedTuple
+
+
+# ---- Module parameter descriptor ----
+
+class ModuleParam(NamedTuple):
+    """Describes a single configurable parameter exposed by a module."""
+    name: str
+    type: type
+    default: object
+    description: str = ""
+
+
+class InterceptableCommand(NamedTuple):
+    """Describes a command a module can gate for user approval."""
+    name: str
+    description: str = ""
+    intercept: bool = False  # module author sets the safe default
 
 
 # ---- Parameter group definitions ----
@@ -82,6 +99,11 @@ PARAMETER_GROUPS = {
             "beam_log_tree", "beam_top_results",
             "branch_at", "branch_pick",
         ],
+    },
+    "chat": {
+        "description": "Chat template and system prompt",
+        "loading": [],
+        "generation": ["chat_template", "system_prompt"],
     },
 }
 
@@ -248,6 +270,10 @@ class GenerationConfig:
     branch_at: int = 0                 # force an alternate token at this generation step
     branch_pick: int = 0               # which rank alternative to pick at the branch point
 
+    # --- Chat template ---
+    chat_template: str = "none"        # template name (matches JSON filename stem, or "none")
+    system_prompt: str = ""            # system message content; empty = skip system block
+
     def to_generation_kwargs(self, active_groups: list[str]) -> dict:
         """Build kwargs dict filtered by *active_groups*.
 
@@ -333,6 +359,10 @@ class RunnerConfig:
     active_groups: list[str] = field(
         default_factory=lambda: ["essential", "visibility"]
     )
+    module_config: dict = field(default_factory=dict)
+    module_access: dict = field(default_factory=dict)
+    module_intercept: dict = field(default_factory=dict)
+    # {"module_name": {"command_name": True/False}}
 
     @classmethod
     def from_file(cls, path: str, model_path: str = "") -> "RunnerConfig":
@@ -367,10 +397,25 @@ class RunnerConfig:
             generation_config=gc,
             model_name=data.get("model_name", "model"),
             active_groups=active,
+            module_config=data.get("module_config", {}),
+            module_access=data.get("module_access", {}),
+            module_intercept=data.get("module_intercept", {}),
         )
 
-    def to_file(self, path: str):
-        """Persist current config to a JSON file."""
+    def to_file(self, path: str, module_schemas: dict | None = None,
+                intercept_schemas: dict | None = None):
+        """Persist current config to a JSON file.
+
+        *module_schemas* is an optional ``{name: [ModuleParam, ...]}`` dict.
+        When provided, enabled installed modules get their config filled with
+        schema defaults (self-documenting).  Disabled modules are omitted.
+        Uninstalled-but-enabled module configs are preserved as-is.
+
+        *intercept_schemas* is an optional ``{name: [InterceptableCommand, ...]}``
+        dict.  When provided, enabled modules get their intercept entries filled
+        with schema defaults (``intercept``).  When ``None``, the
+        existing ``module_intercept`` data is preserved as-is.
+        """
         group_toggles = {
             g: (g in self.active_groups or g == "essential")
             for g in PARAMETER_GROUPS
@@ -379,11 +424,47 @@ class RunnerConfig:
         mc_dict = _serializable_fields(self.model_config)
         gc_dict = _serializable_fields(self.generation_config)
 
+        # Build module_config / module_access for output.
+        # A module is "enabled" only if module_access says True (opt-in).
+        # Disabled modules are omitted from module_config.
+        out_module_config: dict = {}
+        out_module_access: dict = {}
+        out_module_intercept: dict = {}
+        schemas = module_schemas or {}
+        i_schemas = intercept_schemas or {}
+
+        # Collect every module name the user has explicitly touched
+        all_mod_names = set(self.module_access) | set(self.module_config)
+
+        for mod_name in all_mod_names:
+            enabled = self.module_access.get(mod_name, False)
+            out_module_access[mod_name] = enabled
+            if not enabled:
+                continue
+            cfg = dict(self.module_config.get(mod_name, {}))
+            if mod_name in schemas:
+                for p in schemas[mod_name]:
+                    cfg.setdefault(p.name, p.default)
+            out_module_config[mod_name] = cfg
+
+            # Build intercept settings for this module
+            existing = self.module_intercept.get(mod_name, {})
+            if i_schemas and mod_name in i_schemas:
+                intercept_cfg = dict(existing)
+                for cmd in i_schemas[mod_name]:
+                    intercept_cfg.setdefault(cmd.name, cmd.intercept)
+                out_module_intercept[mod_name] = intercept_cfg
+            elif existing:
+                out_module_intercept[mod_name] = existing
+
         data = {
             "model_name": self.model_name,
             "active_groups": group_toggles,
             "model_config": mc_dict,
             "generation_config": gc_dict,
+            "module_config": out_module_config,
+            "module_access": out_module_access,
+            "module_intercept": out_module_intercept,
         }
         with open(path, "w") as fh:
             json.dump(data, fh, indent=2)

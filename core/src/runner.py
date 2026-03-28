@@ -6,6 +6,7 @@ in a background thread with a state machine and prompt queue.
 """
 import ctypes
 import io
+import os
 import queue
 import threading
 import time
@@ -21,6 +22,10 @@ from params import (
     ModelConfig, GenerationConfig, RunnerConfig,
     ParameterVisibility,
 )
+from chat_format import apply_template, get_stop_tokens, load_template
+
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(_SRC_DIR)), "templates")
 
 
 _runner_counter = 0
@@ -200,6 +205,20 @@ class ModelRunner:
         beam_top_results = kwargs.pop("beam_top_results", 0)
         branch_at = kwargs.pop("branch_at", 0)
         branch_pick = kwargs.pop("branch_pick", 0)
+
+        # Chat template params -- not passed to llama-cpp
+        chat_template_name = kwargs.pop("chat_template", "none")
+        system_prompt = kwargs.pop("system_prompt", "")
+
+        if chat_template_name != "none":
+            template = load_template(_TEMPLATES_DIR, chat_template_name)
+            prompt = apply_template(template, system_prompt, prompt)
+            self._basic_log(f"Chat template: {chat_template_name}")
+            if not kwargs.get("stop"):
+                auto_stop = get_stop_tokens(template)
+                if auto_stop:
+                    kwargs["stop"] = auto_stop
+                    self._basic_log(f"Auto-stop tokens: {auto_stop}")
 
         if beam_width > 1:
             max_tokens = kwargs.pop("max_tokens", 256)
