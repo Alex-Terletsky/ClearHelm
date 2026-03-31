@@ -86,7 +86,7 @@ class _StdoutRouter(io.StringIO):
 
     def write(self, s: str) -> int:
         if s and s != '\n':
-            self._output_fn(f"<basic_log>{s}</basic_log>")
+            self._output_fn(f"<basic_log>{s}\n</basic_log>")
         return len(s)
 
     def flush(self):
@@ -181,6 +181,7 @@ class ModelRunner:
             llama_cpp.llama_log_set(_global_llama_log_cb, ctypes.c_void_p(0))
 
         load_time = time.time() - start
+        self._emit('\n')
         self._log(f"Loaded in {load_time:.2f}s")
 
     def generate(self, prompt: str,
@@ -261,7 +262,7 @@ class ModelRunner:
         elapsed = time.time() - start
         tps = generated_tokens / elapsed if elapsed > 0 else 0
 
-        self._emit(f"\n{'-'*40}\n")
+        self._emit(f"{'-'*40}\n")
         self._log("STATS:")
         self._emit(f"  Output tokens: {generated_tokens}\n")
         self._emit(f"  Time: {elapsed:.2f}s\n")

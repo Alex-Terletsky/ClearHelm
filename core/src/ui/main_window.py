@@ -5,9 +5,9 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QTextEdit, QLineEdit,
-    QScrollArea, QDialog, QFileDialog, QMessageBox,
-    QSizePolicy, QButtonGroup,
+    QPushButton, QTextEdit, QLineEdit,
+    QDialog, QFileDialog, QMessageBox,
+    QButtonGroup,
 )
 from PySide6.QtGui import QColor, QTextCursor, QFont, QTextCharFormat
 
@@ -20,9 +20,9 @@ from .constants import (
     _MODELS_DIR, _CONFIGS_DIR, _CONFIG_PATH, _MODULES_DIR,
     _AGENT_COLORS, _COMBINED_RE,
     _BASIC_COLOR, _VERBOSE_COLOR, _DEFAULT_COLOR, _parse_segment,
-    DARK_STYLE,
+    DARK_STYLE, ECHO_NAME, MULTI_SESSION_RENDER_CAP,
 )
-from .widgets import SignalBridge, NoScrollComboBox
+from .widgets import SignalBridge
 from .agents import _load_agent_configs, _save_agent_config, _delete_agent_config
 from .sidebar import ModelSidebar
 from .parameter_panel import ParameterPanel
@@ -49,8 +49,13 @@ class MainWindow(QMainWindow):
         self._param_model: str | None = None
         self._log_mode: str = "output"   # "output" | "basic" | "verbose"
         self._agent_colors:    dict[str, QColor] = {}
-        self._all_events:      list[tuple[str, str]] = []   # (model_name, raw_text) in order
-        self._last_individual: str = ""                      # last non-"All" selection
+        self._all_events:      list[tuple[str, str | None]] = []  # (name, text) or (name, None) = session marker
+        self._current_chat: str = ""
+        self._multi_view_active: bool = False
+        self._multi_checked: list[str] = []
+        self._session_cursors: list[QTextCursor] = []
+        self._model_session_idx: dict[str, int] = {}
+        self._session_model_names: list[str] = []
 
         # ---- Build UI ----
         central = QWidget()
@@ -73,34 +78,7 @@ class MainWindow(QMainWindow):
         right_layout.setContentsMargins(4, 4, 4, 4)
         right_layout.setSpacing(4)
 
-        # Row 1: Active model selector
-        active_row = QHBoxLayout()
-        active_lbl = QLabel("Chat:")
-        active_lbl.setFixedWidth(46)
-        self._active_combo = NoScrollComboBox()
-        self._active_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        active_row.addWidget(active_lbl)
-        active_row.addWidget(self._active_combo)
-        right_layout.addLayout(active_row)
-        self._active_combo.addItem("All")
-
-        # Row 2: Config preset bar
-        config_row = QHBoxLayout()
-        config_lbl = QLabel("Config:")
-        config_lbl.setFixedWidth(46)
-        self._preset_combo = NoScrollComboBox()
-        self._preset_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self._btn_apply_preset = QPushButton("Apply")
-        self._btn_load_config  = QPushButton("Load...")
-        self._btn_save_config  = QPushButton("Save...")
-        config_row.addWidget(config_lbl)
-        config_row.addWidget(self._preset_combo, stretch=1)
-        config_row.addWidget(self._btn_apply_preset)
-        config_row.addWidget(self._btn_load_config)
-        config_row.addWidget(self._btn_save_config)
-        right_layout.addLayout(config_row)
-
-        # Console panel: output + input row + verbose toggle
+        # Console panel: output + input row + log mode toggle
         console_panel = QWidget()
         console_layout = QVBoxLayout(console_panel)
         console_layout.setContentsMargins(0, 0, 0, 0)
@@ -159,7 +137,7 @@ class MainWindow(QMainWindow):
 
         input_row = QHBoxLayout()
         self._input = QLineEdit()
-        self._input.setPlaceholderText("Enter prompt...")
+        self._input.setPlaceholderText("Select an agent to begin...")
         self._input.setFont(QFont("Consolas", 11))
         self._btn_send = QPushButton("Send")
         self._btn_send.setStyleSheet(
@@ -171,19 +149,8 @@ class MainWindow(QMainWindow):
         input_row.addWidget(self._btn_send)
         console_layout.addLayout(input_row)
 
-        # Param scroll area (independent, below console panel)
-        param_scroll = QScrollArea()
-        param_scroll.setWidgetResizable(True)
-        param_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-
-        param_widget = QWidget()
-        param_layout = QVBoxLayout(param_widget)
-        param_layout.setContentsMargins(0, 4, 0, 4)
-        param_layout.setSpacing(6)
+        # Parameter panel (now manages its own scroll area)
         self._param_panel = ParameterPanel()
-        param_layout.addWidget(self._param_panel)
-        param_layout.addStretch()
-        param_scroll.setWidget(param_widget)
 
         # Module interception panel (collapsible, right of console)
         self._module_panel = ModulePanel()
@@ -195,10 +162,10 @@ class MainWindow(QMainWindow):
         self._console_split.setStretchFactor(1, 0)   # module panel natural width
         self._console_split.setCollapsible(1, False)  # only collapse via drawer button
 
-        # Splitter: console area (output+input+verbose+module panel) vs. param panel
+        # Splitter: console area vs. param panel
         v_split = QSplitter(Qt.Vertical)
         v_split.addWidget(self._console_split)
-        v_split.addWidget(param_scroll)
+        v_split.addWidget(self._param_panel)
         v_split.setStretchFactor(0, 3)
         v_split.setStretchFactor(1, 1)
 
@@ -213,30 +180,31 @@ class MainWindow(QMainWindow):
         self._sidebar.add_requested.connect(self._add_agent)
         self._sidebar.delete_requested.connect(self._delete_agent)
         self._sidebar.selection_changed.connect(self._on_sidebar_selection_changed)
-        self._sidebar.save_requested.connect(self._save_agent)
-        self._active_combo.currentTextChanged.connect(self._on_active_changed)
+        self._sidebar.multi_view_changed.connect(self._on_multi_view_changed)
+        self._sidebar.multi_selection_changed.connect(self._on_multi_selection_changed)
         self._btn_send.clicked.connect(self._send_prompt)
         self._input.returnPressed.connect(self._send_prompt)
-        self._btn_apply_preset.clicked.connect(self._apply_preset_from_combo)
-        self._btn_load_config.clicked.connect(self._load_config_file)
-        self._btn_save_config.clicked.connect(self._save_config)
         self._log_btn_group.idClicked.connect(self._on_log_mode_changed)
         self._btn_drawer.clicked.connect(self._on_drawer_toggled)
         self._module_panel.badge_changed.connect(self._on_badge_changed)
         self._module_panel.expanded_changed.connect(self._btn_drawer.setChecked)
+        self._param_panel.save_config_requested.connect(self._on_param_save_config)
+        self._param_panel.save_agent_requested.connect(self._on_param_save_agent)
+        self._param_panel.apply_requested.connect(self._on_param_apply)
 
         # ---- Status poll timer ----
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll_status)
         self._timer.start(500)
 
-        # ---- Load saved agents and presets ----
+        # ---- Load saved agents ----
         self._load_saved_agents()
-        self._populate_presets()
 
-        # ---- Built-in virtual agents ----
-        self._histories["Echo"] = ""
-        self._chat_combo_add("Echo")
+        # ---- Echo virtual agent ----
+        self._sidebar.add_echo()
+        self._histories[ECHO_NAME] = ""
+        self._agent_colors[ECHO_NAME] = self._assign_agent_color(ECHO_NAME)
+        self._sidebar.set_agent_color(ECHO_NAME, self._agent_colors[ECHO_NAME].name())
 
         # ---- Module system ----
         _ctx = ModuleContext(
@@ -256,8 +224,9 @@ class MainWindow(QMainWindow):
         self._param_panel.set_module_schemas(self._module_manager.module_schemas)
         self._param_panel.set_intercept_schemas(self._module_manager.intercept_schemas)
 
-        # Initialise the "All" view state now that signals are connected and agents loaded
-        self._on_active_changed(self._active_combo.currentText())
+        # Auto-select first agent if any exist
+        if self._sidebar.list.count() > 0:
+            self._sidebar.list.setCurrentRow(0)
 
     # ---- Module config helpers ----
 
@@ -270,8 +239,7 @@ class MainWindow(QMainWindow):
 
     def _active_agent_name(self) -> str | None:
         """Return the name of the agent currently targeted for interaction."""
-        current = self._active_combo.currentText()
-        return self._last_individual if current == "All" else (current or None)
+        return self._current_chat or None
 
     def _get_module_config(self, module_name: str) -> dict:
         """Read the active agent's config for *module_name*, with defaults merged."""
@@ -304,24 +272,14 @@ class MainWindow(QMainWindow):
             module_name, command_name, agent_name,
             description, action, on_deny)
 
-    # ---- Chat combo helpers ----
+    # ---- Agent color assignment ----
 
     def _assign_agent_color(self, name: str) -> QColor:
-        used = list(self._agent_colors.values())  # list avoids QColor __hash__ requirement
+        used = list(self._agent_colors.values())
         for c in _AGENT_COLORS:
             if c not in used:
                 return c
         return _AGENT_COLORS[len(self._agent_colors) % len(_AGENT_COLORS)]
-
-    def _chat_combo_add(self, name: str):
-        self._agent_colors[name] = self._assign_agent_color(name)
-        self._active_combo.addItem(name)
-
-    def _chat_combo_remove(self, name: str):
-        idx = self._active_combo.findText(name)
-        if idx >= 0:
-            self._active_combo.removeItem(idx)
-        self._agent_colors.pop(name, None)
 
     # ---- Agent loading / registration ----
 
@@ -333,7 +291,8 @@ class MainWindow(QMainWindow):
                 self._manager.add_model(name, path, config=cfg)
                 self._histories[name] = ""
                 self._sidebar.add_agent(name)
-                self._chat_combo_add(name)
+                self._agent_colors[name] = self._assign_agent_color(name)
+                self._sidebar.set_agent_color(name, self._agent_colors[name].name())
             except Exception:
                 pass
 
@@ -368,9 +327,12 @@ class MainWindow(QMainWindow):
         self._manager.add_model(name, model["path"], config=config)
         self._histories[name] = ""
         self._sidebar.add_agent(name)
-        self._chat_combo_add(name)
+        self._agent_colors[name] = self._assign_agent_color(name)
+        self._sidebar.set_agent_color(name, self._agent_colors[name].name())
 
     def _delete_agent(self, name: str):
+        if name == ECHO_NAME:
+            return
         reply = QMessageBox.warning(
             self, "Delete Agent",
             f'Permanently delete agent "{name}"?\n\nThis will remove its saved config and cannot be undone.',
@@ -384,12 +346,18 @@ class MainWindow(QMainWindow):
         self._manager.remove_model(name)
         self._sidebar.remove_agent(name)
         self._histories.pop(name, None)
-        self._chat_combo_remove(name)
+        self._agent_colors.pop(name, None)
         self._all_events = [(n, t) for n, t in self._all_events if n != name]
+        if self._multi_view_active:
+            self._reload_multi()
         if self._param_model == name:
             self._param_panel.set_config(None)
             self._param_panel.set_state(None)
+            self._param_panel.set_agent_name("")
             self._param_model = None
+        if self._current_chat == name:
+            self._current_chat = ""
+            self._output.clear()
 
     def _save_agent(self, name: str):
         try:
@@ -400,143 +368,215 @@ class MainWindow(QMainWindow):
         except KeyError:
             pass
 
-    # ---- Preset / config ----
+    # ---- Parameter panel callbacks ----
 
-    def _populate_presets(self):
-        """Scan configs dir and fill the preset combo."""
-        self._preset_combo.clear()
-        for c in discover_configs(_CONFIGS_DIR):
-            self._preset_combo.addItem(c["name"], userData=c["path"])
-        default_idx = self._preset_combo.findText("default", Qt.MatchFixedString | Qt.MatchCaseSensitive)
-        if default_idx >= 0:
-            self._preset_combo.setCurrentIndex(default_idx)
-
-    def _current_target_model(self) -> str | None:
-        """Return the model to act on: active READY model, or sidebar selection."""
-        name = self._active_combo.currentText()
-        return name if name else self._sidebar.selected_model()
-
-    def _apply_preset(self, path: str):
-        """Load a config JSON and apply it to the currently targeted model."""
-        name = self._current_target_model()
+    def _on_param_save_config(self):
+        """Save the staged config to a user-chosen file."""
+        name = self._param_model
         if not name:
-            QMessageBox.information(self, "No Model Selected",
-                                    "Select a model in the sidebar first.")
+            return
+        staged = self._param_panel.staged_config()
+        if staged is None:
+            return
+        default_path = os.path.join(_CONFIGS_DIR, f"{name}.json")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Config", default_path, "JSON Files (*.json)")
+        if path:
+            try:
+                staged.to_file(path,
+                               module_schemas=self._module_manager.module_schemas,
+                               intercept_schemas=self._module_manager.intercept_schemas)
+            except Exception as e:
+                QMessageBox.warning(self, "Save Error", str(e))
+
+    def _on_param_save_agent(self):
+        """Save the current live config as the agent's persistent file."""
+        name = self._param_model
+        if name:
+            self._save_agent(name)
+
+    def _on_param_apply(self):
+        """Post-apply hook: sync active groups to the RunnerService."""
+        name = self._param_model
+        if not name:
             return
         try:
-            cfg = self._manager.get_config(name)
-            saved_path = cfg.model_config.model_path
-            saved_name = cfg.model_name
-            new_cfg = RunnerConfig.from_file(path, model_path=saved_path)
-            # Update fields on the existing RunnerConfig instance so RunnerService's
-            # reference to the config object stays valid.
-            cfg.active_groups      = new_cfg.active_groups
-            cfg.model_config       = new_cfg.model_config
-            cfg.generation_config  = new_cfg.generation_config
-            cfg.module_config      = new_cfg.module_config
-            cfg.module_access      = new_cfg.module_access
-            cfg.module_intercept   = new_cfg.module_intercept
-            cfg.model_name         = saved_name
-            self._param_panel.set_config(cfg)
-        except Exception as e:
-            QMessageBox.warning(self, "Preset Error", str(e))
-
-    def _apply_preset_from_combo(self):
-        path = self._preset_combo.currentData()
-        if path:
-            self._apply_preset(path)
-
-    def _load_config_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load Config File", _CONFIGS_DIR, "JSON Files (*.json)"
-        )
-        if path:
-            self._apply_preset(path)
-
-    def _save_config(self):
-        name = self._current_target_model()
-        if not name:
-            QMessageBox.information(self, "No Model Selected",
-                                    "Select a model in the sidebar first.")
-            return
-        try:
-            cfg = self._manager.get_config(name)
-            default_path = os.path.join(_CONFIGS_DIR, f"{name}.json")
-            path, _ = QFileDialog.getSaveFileName(
-                self, "Save Config", default_path, "JSON Files (*.json)"
-            )
-            if path:
-                cfg.to_file(path,
-                            module_schemas=self._module_manager.module_schemas,
-                            intercept_schemas=self._module_manager.intercept_schemas)
-                self._populate_presets()  # refresh list if saved to configs dir
-        except Exception as e:
-            QMessageBox.warning(self, "Save Error", str(e))
+            groups = self._param_panel.active_groups()
+            self._manager.update_active_groups(name, groups)
+        except KeyError:
+            pass
 
     # ---- Load / unload ----
 
     def _load_model(self, name: str):
+        if name == ECHO_NAME:
+            return
         state = self._manager.get_state(name)
         if state not in (ServiceState.IDLE, ServiceState.ERROR):
             return
         self._manager.start_model(name)
 
     def _unload_model(self, name: str):
+        if name == ECHO_NAME:
+            return
         state = self._manager.get_state(name)
         if state in (ServiceState.IDLE, ServiceState.STOPPING):
             return
         self._module_panel.remove_requests_for_agent(name)
         self._manager.stop_model(name)
 
-    # ---- Active model switching ----
+    # ---- Sidebar selection -> chat + param switching ----
 
     def _on_sidebar_selection_changed(self, name: str):
         if not name:
             return
-        try:
-            cfg = self._manager.get_config(name)
-            state = self._manager.get_state(name)
-            self._param_model = name
-            self._param_panel.set_config(cfg)
-            self._param_panel.set_state(state)
-        except KeyError:
-            pass
 
-    def _on_active_changed(self, name: str):
-        if not name:
-            return
-        if name == "All":
-            self._manager.set_active(None)
-            placeholder = (f"Enter prompt to {self._last_individual}..."
-                           if self._last_individual else "No agent selected")
-            self._input.setPlaceholderText(placeholder)
-            QTimer.singleShot(0, self._reload_all)
+        # Switch chat view (unless multi view is active)
+        self._current_chat = name
+        self._input.setPlaceholderText(f"Enter prompt to {name}...")
+        if not self._multi_view_active:
+            QTimer.singleShot(0, lambda n=name: self._reload_output(n))
+
+        # Update parameter panel
+        self._param_panel.set_agent_name(name)
+        if name == ECHO_NAME:
+            self._param_model = None
             self._param_panel.set_config(None)
             self._param_panel.set_state(None)
-            self._param_model = None
-            self._module_manager.set_target_agent(self._last_individual or None)
-            self._module_panel.set_agent_filter(None)
-            return
-        # Individual agent
-        self._last_individual = name
-        self._input.setPlaceholderText("Enter prompt...")
+            self._sidebar.update_load_button(None)
+        else:
+            try:
+                cfg = self._manager.get_config(name)
+                state = self._manager.get_state(name)
+                self._param_model = name
+                self._param_panel.set_config(cfg)
+                self._param_panel.set_state(state)
+                self._sidebar.update_load_button(state)
+            except KeyError:
+                self._param_panel.set_config(None)
+                self._param_panel.set_state(None)
+                self._param_model = None
+                self._sidebar.update_load_button(None)
+
+        # Module panel filter
         self._module_manager.set_target_agent(name)
         self._module_panel.set_agent_filter(name)
-        try:
-            self._manager.set_active(name)
-        except KeyError:
-            pass
-        QTimer.singleShot(0, lambda: self._reload_output(name))
-        try:
-            cfg   = self._manager.get_config(name)
-            state = self._manager.get_state(name)
-            self._param_model = name
-            self._param_panel.set_config(cfg)
-            self._param_panel.set_state(state)
-        except KeyError:
-            self._param_panel.set_config(None)
-            self._param_panel.set_state(None)
-            self._param_model = None
+
+        # Set active model in manager
+        if name != ECHO_NAME:
+            try:
+                self._manager.set_active(name)
+            except KeyError:
+                pass
+
+    # ---- Multi View ----
+
+    def _is_scrolled_to_bottom(self) -> bool:
+        sb = self._output.verticalScrollBar()
+        return sb.value() >= sb.maximum() - 10
+
+    def _register_session_cursor(self, doc, position: int, model_name: str) -> None:
+        """Create a session cursor at *position* and register it for *model_name*."""
+        cursor = QTextCursor(doc)
+        cursor.setPosition(position)
+        self._session_cursors.append(cursor)
+        self._session_model_names.append(model_name)
+        self._model_session_idx[model_name] = len(self._session_cursors) - 1
+
+    def _append_session_header(self, model_name: str) -> None:
+        """Append a bold [ModelName] header at the document end and register a session cursor."""
+        doc = self._output.document()
+        cursor = QTextCursor(doc)
+        cursor.movePosition(QTextCursor.End)
+        if doc.characterCount() > 1:
+            cursor.insertText("\n")
+        fmt = QTextCharFormat()
+        color = self._agent_colors.get(model_name, _DEFAULT_COLOR)
+        fmt.setForeground(color)
+        fmt.setFontWeight(QFont.Bold)
+        cursor.insertText(f"[{model_name}]\n", fmt)
+        self._register_session_cursor(doc, cursor.position(), model_name)
+
+    def _on_multi_view_changed(self, active: bool):
+        self._multi_view_active = active
+        if active:
+            self._reload_multi()
+        else:
+            self._session_cursors.clear()
+            self._model_session_idx.clear()
+            self._session_model_names.clear()
+            if self._current_chat:
+                QTimer.singleShot(0, lambda: self._reload_output(self._current_chat))
+
+    def _on_multi_selection_changed(self, names: list):
+        self._multi_checked = names
+        if self._multi_view_active:
+            self._reload_multi()
+
+    def _reload_multi(self) -> None:
+        """Rebuild console with session-grouped output from checked agents."""
+        was_at_bottom = self._is_scrolled_to_bottom()
+        saved_scroll = self._output.verticalScrollBar().value()
+
+        self._output.clear()
+        self._session_cursors.clear()
+        self._model_session_idx.clear()
+        self._session_model_names.clear()
+
+        if not self._all_events or not self._multi_checked:
+            return
+
+        # Parse _all_events into ordered sessions
+        sessions: list[tuple[str, list[str]]] = []
+        last_session_for: dict[str, int] = {}
+
+        for name, text in self._all_events:
+            if name not in self._multi_checked:
+                continue
+            if text is None or name not in last_session_for:
+                last_session_for[name] = len(sessions)
+                sessions.append((name, []))
+            if text is not None:
+                sessions[last_session_for[name]][1].append(text)
+
+        # Render sessions with cap
+        doc = self._output.document()
+        cursor = QTextCursor(doc)
+
+        for session_model, chunks in sessions:
+            if not chunks:
+                continue
+
+            # Header
+            cursor.movePosition(QTextCursor.End)
+            if doc.characterCount() > 1:
+                cursor.insertText("\n")
+            hdr_fmt = QTextCharFormat()
+            color = self._agent_colors.get(session_model, _DEFAULT_COLOR)
+            hdr_fmt.setForeground(color)
+            hdr_fmt.setFontWeight(QFont.Bold)
+            cursor.insertText(f"[{session_model}]\n", hdr_fmt)
+
+            # Apply render cap
+            if len(chunks) > MULTI_SESSION_RENDER_CAP:
+                trunc_fmt = QTextCharFormat()
+                trunc_fmt.setForeground(QColor("#6c7086"))
+                cursor.insertText("[... truncated]\n", trunc_fmt)
+                chunks = chunks[-MULTI_SESSION_RENDER_CAP:]
+
+            for text in chunks:
+                self._render_segments(cursor, text, agent_color=color)
+
+            # Store session cursor at end of this block
+            cursor.movePosition(QTextCursor.End)
+            self._register_session_cursor(doc, cursor.position(), session_model)
+
+        # Scroll preservation
+        sb = self._output.verticalScrollBar()
+        if was_at_bottom:
+            sb.setValue(sb.maximum())
+        else:
+            sb.setValue(saved_scroll)
 
     # ---- Output routing ----
 
@@ -603,24 +643,12 @@ class MainWindow(QMainWindow):
         self._output.setTextCursor(cursor)
         self._output.ensureCursorVisible()
 
-    def _reload_all(self) -> None:
-        self._output.clear()
-        if not self._all_events:
-            return
-        cursor = self._output.textCursor()
-        for name, text in self._all_events:
-            color = self._agent_colors.get(name, _DEFAULT_COLOR)
-            self._render_segments(cursor, text, agent_color=color)
-        self._output.setTextCursor(cursor)
-        self._output.ensureCursorVisible()
-
     def _on_log_mode_changed(self, btn_id: int) -> None:
         self._log_mode = ("output", "basic", "verbose")[btn_id]
-        active = self._active_combo.currentText()
-        if active == "All":
-            self._reload_all()
-        elif active:
-            self._reload_output(active)
+        if self._multi_view_active:
+            self._reload_multi()
+        elif self._current_chat:
+            self._reload_output(self._current_chat)
 
     def _on_drawer_toggled(self):
         expanded = self._btn_drawer.isChecked()
@@ -650,14 +678,29 @@ class MainWindow(QMainWindow):
         self._all_events.append((model_name, text))
         self._module_manager.on_output(model_name, text)
 
-        current = self._active_combo.currentText()
-        if current not in ("All", model_name):
+        if self._multi_view_active:
+            if model_name not in self._multi_checked:
+                return
+            color = self._agent_colors.get(model_name, _DEFAULT_COLOR)
+            idx = self._model_session_idx.get(model_name)
+            if idx is None:
+                at_bottom = self._is_scrolled_to_bottom()
+                self._append_session_header(model_name)
+                idx = self._model_session_idx[model_name]
+            else:
+                at_bottom = self._is_scrolled_to_bottom()
+            self._render_segments(self._session_cursors[idx], text, agent_color=color)
+            if at_bottom:
+                self._output.verticalScrollBar().setValue(
+                    self._output.verticalScrollBar().maximum())
+            return
+
+        if model_name != self._current_chat:
             return
 
         cursor = self._output.textCursor()
         cursor.movePosition(QTextCursor.End)
-        color = self._agent_colors.get(model_name, _DEFAULT_COLOR) if current == "All" else None
-        if self._render_segments(cursor, text, agent_color=color):
+        if self._render_segments(cursor, text):
             self._output.setTextCursor(cursor)
             self._output.ensureCursorVisible()
 
@@ -667,8 +710,7 @@ class MainWindow(QMainWindow):
         prompt = self._input.text().strip()
         if not prompt:
             return
-        current = self._active_combo.currentText()
-        active = self._last_individual if current == "All" else current
+        active = self._current_chat
         if not active:
             return
 
@@ -676,30 +718,39 @@ class MainWindow(QMainWindow):
             self._input.clear()
             return
 
-        groups = self._param_panel.active_groups()
-        try:
-            self._manager.update_active_groups(active, groups)
-        except KeyError:
-            pass
+        if active != ECHO_NAME:
+            groups = self._param_panel.active_groups()
+            try:
+                self._manager.update_active_groups(active, groups)
+            except KeyError:
+                pass
 
         self._input.clear()
         echo = f"\n> {prompt}\n"
         self._histories.setdefault(active, "")
         self._histories[active] += echo
+        self._all_events.append((active, None))    # session marker
         self._all_events.append((active, echo))
 
-        cursor = self._output.textCursor()
-        cursor.movePosition(QTextCursor.End)
-        if current == "All":
-            color = self._agent_colors.get(active, _DEFAULT_COLOR)
-            self._insert_formatted(cursor, echo, 'plain', agent_color=color)
+        if self._multi_view_active:
+            if active in self._multi_checked:
+                at_bottom = self._is_scrolled_to_bottom()
+                self._append_session_header(active)
+                session_cursor = self._session_cursors[self._model_session_idx[active]]
+                color = self._agent_colors.get(active, _DEFAULT_COLOR)
+                self._insert_formatted(session_cursor, echo, 'plain', agent_color=color)
+                if at_bottom:
+                    self._output.verticalScrollBar().setValue(
+                        self._output.verticalScrollBar().maximum())
         else:
+            cursor = self._output.textCursor()
+            cursor.movePosition(QTextCursor.End)
             self._insert_formatted(cursor, echo, 'plain')
-        self._output.setTextCursor(cursor)
-        self._output.ensureCursorVisible()
+            self._output.setTextCursor(cursor)
+            self._output.ensureCursorVisible()
 
-        if active == "Echo":
-            self._manager_output("Echo", prompt + "\n")
+        if active == ECHO_NAME:
+            self._manager_output(ECHO_NAME, prompt + "\n")
         else:
             self._manager.submit_prompt(prompt, model_name=active)
 
@@ -709,6 +760,14 @@ class MainWindow(QMainWindow):
         statuses = self._manager.get_all_status()
         for name, state in statuses.items():
             self._sidebar.update_status(name, state)
+
+        # Keep Load/Unload button in sync with selected agent
+        selected = self._sidebar.selected_model()
+        if selected and selected != ECHO_NAME:
+            try:
+                self._sidebar.update_load_button(self._manager.get_state(selected))
+            except KeyError:
+                pass
 
         if self._param_model:
             try:

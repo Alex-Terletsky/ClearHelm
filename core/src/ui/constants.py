@@ -17,6 +17,7 @@ _AGENTS_DIR  = os.path.join(_PROJECT_ROOT, "agents")
 _MODULES_DIR = os.path.join(_PROJECT_ROOT, "modules")
 _TEMPLATES_DIR = os.path.join(_PROJECT_ROOT, "templates")
 
+ECHO_NAME = "Echo"
 
 # ---- Status badge colors ----
 
@@ -48,6 +49,8 @@ _COMBINED_RE   = re.compile(
 _BASIC_COLOR   = QColor("#89dceb")   # Catppuccin sky — light blue
 _VERBOSE_COLOR = QColor("#fab387")   # Catppuccin peach — warm light orange
 _DEFAULT_COLOR = QColor("#cdd6f4")   # Catppuccin lavender — matches existing stylesheet
+
+MULTI_SESSION_RENDER_CAP = 2000      # max chunks per session during full re-render
 
 
 def _parse_segment(part: str) -> tuple[str, str]:
@@ -81,6 +84,9 @@ QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     border-radius: 4px;
     padding: 4px 6px;
     selection-background-color: #585b70;
+}
+QSpinBox, QDoubleSpinBox {
+    padding-right: 26px;
 }
 QComboBox::drop-down {
     border: none;
@@ -160,17 +166,5 @@ QSplitter::handle {
 }
 QSplitter::handle:hover {
     background-color: #89b4fa;
-}
-QPushButton#agentDelete {
-    background-color: transparent;
-    color: #6c7086;
-    border: 1px solid transparent;
-    border-radius: 3px;
-    padding: 0;
-    min-height: 0;
-}
-QPushButton#agentDelete:hover {
-    color: #f38ba8;
-    border-color: #f38ba8;
 }
 """

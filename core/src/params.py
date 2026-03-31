@@ -107,6 +107,71 @@ PARAMETER_GROUPS = {
     },
 }
 
+# ---- Per-parameter metadata (tooltips, widget constraints) ----
+# Only min/max/step/decimals where bounds are truly fixed regardless of model.
+
+PARAM_META: dict[str, dict] = {
+    # ModelConfig
+    "model_path":       {"description": "Path to the .gguf model file"},
+    "n_ctx":            {"description": "Context window size in tokens", "min": 1},
+    "n_gpu_layers":     {"description": "Layers to offload to GPU (-1 = all)"},
+    "n_threads":        {"description": "CPU threads for generation (None = auto)"},
+    "n_threads_batch":  {"description": "CPU threads for prompt eval (None = auto)"},
+    "n_batch":          {"description": "Prompt processing batch size", "min": 1},
+    "n_ubatch":         {"description": "Physical batch size for computation", "min": 1},
+    "use_mmap":         {"description": "Memory-map model file (faster load, less RAM)"},
+    "use_mlock":        {"description": "Lock model in RAM (prevents swapping)"},
+    "offload_kqv":      {"description": "Offload KV cache to GPU"},
+    "flash_attn":       {"description": "Use flash attention (faster, less VRAM)"},
+    "logits_all":       {"description": "Compute logits for all tokens (required for beam search)"},
+    "rope_freq_base":   {"description": "RoPE base frequency (0 = model default)"},
+    "rope_freq_scale":  {"description": "RoPE frequency scaling factor (0 = model default)"},
+    "rope_scaling_type": {"description": "RoPE scaling type (-1 = model default)"},
+    "yarn_ext_factor":  {"description": "YaRN extrapolation factor (-1 = model default)"},
+    "yarn_attn_factor": {"description": "YaRN attention scaling factor"},
+    "yarn_beta_fast":   {"description": "YaRN beta fast"},
+    "yarn_beta_slow":   {"description": "YaRN beta slow"},
+    "yarn_orig_ctx":    {"description": "Original context size the model was trained with", "min": 0},
+    "lora_path":        {"description": "Path to LoRA adapter file"},
+    "lora_base":        {"description": "Path to base model for LoRA scaling"},
+    "lora_scale":       {"description": "LoRA adapter strength", "min": 0.0, "step": 0.1, "decimals": 2},
+    "verbose":          {"description": "Print llama.cpp loading/inference logs"},
+    "seed":             {"description": "RNG seed (-1 = random)"},
+    "tensor_split":     {"description": "Fraction of model to put on each GPU"},
+    "main_gpu":         {"description": "GPU used for scratch and small tensors", "min": 0},
+    "split_mode":       {"description": "How to split across GPUs (1 = layer, 2 = row)", "min": 0, "max": 2},
+    "draft_model":      {"description": "Smaller draft model for speculative decoding"},
+    # GenerationConfig
+    "max_tokens":       {"description": "Maximum tokens to generate", "min": 1},
+    "temperature":      {"description": "Randomness (0 = deterministic, higher = more random)", "min": 0.0, "step": 0.05, "decimals": 2},
+    "stop":             {"description": "Stop generation when any of these strings appear"},
+    "top_p":            {"description": "Nucleus sampling: consider tokens covering top p% probability", "min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2},
+    "top_k":            {"description": "Only sample from the top k tokens", "min": 0},
+    "repeat_penalty":   {"description": "Penalise recently used tokens (1.0 = off)", "min": 0.0, "step": 0.05, "decimals": 2},
+    "min_p":            {"description": "Minimum probability relative to the top token", "min": 0.0, "max": 1.0, "step": 0.01, "decimals": 2},
+    "typical_p":        {"description": "Locally typical sampling threshold (1.0 = off)", "min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2},
+    "tfs_z":            {"description": "Tail free sampling z-value (1.0 = off)", "min": 0.0, "max": 1.0, "step": 0.05, "decimals": 2},
+    "frequency_penalty": {"description": "Penalise tokens by how often they've appeared", "min": 0.0, "step": 0.05, "decimals": 2},
+    "presence_penalty": {"description": "Penalise tokens that have appeared at all", "min": 0.0, "step": 0.05, "decimals": 2},
+    "mirostat_mode":    {"description": "Mirostat sampling version (0 = off, 1 or 2)", "min": 0, "max": 2},
+    "mirostat_tau":     {"description": "Mirostat target entropy", "min": 0.0, "step": 0.1, "decimals": 1},
+    "mirostat_eta":     {"description": "Mirostat learning rate", "min": 0.0, "step": 0.01, "decimals": 2},
+    "grammar":          {"description": "GBNF grammar object to constrain output format"},
+    "logit_bias":       {"description": "Manually adjust token probabilities {token_id: bias}"},
+    "logprobs":         {"description": "Return log probabilities for top N tokens", "min": 0},
+    "stream":           {"description": "Yield tokens as they are generated"},
+    "echo":             {"description": "Include the prompt in the output"},
+    "beam_width":       {"description": "Number of beams (1 = standard greedy/sampling)", "min": 1},
+    "beam_depth":       {"description": "Max steps for beam search (0 = use max_tokens)", "min": 0},
+    "length_penalty":   {"description": "Normalise beam scores by length (1.0 = off)", "min": 0.0, "step": 0.1, "decimals": 2},
+    "beam_log_tree":    {"description": "Print the full beam expansion tree"},
+    "beam_top_results": {"description": "How many beams to display (0 = beam_width)", "min": 0},
+    "branch_at":        {"description": "Force an alternate token at this generation step", "min": 0},
+    "branch_pick":      {"description": "Which rank alternative to pick at the branch point", "min": 0},
+    "chat_template":    {"description": "Template name (matches JSON filename stem, or \"none\")"},
+    "system_prompt":    {"description": "System message content; empty = skip system block"},
+}
+
 # Reverse lookups: param_name -> group_name
 _LOADING_PARAM_GROUP: dict[str, str] = {}
 _GENERATION_PARAM_GROUP: dict[str, str] = {}
@@ -164,49 +229,49 @@ class ModelConfig:
     """
 
     # --- Essential ---
-    model_path: str = ""                   # path to the .gguf model file
-    n_ctx: int = 4096                      # context window size in tokens
-    n_gpu_layers: int = -1                 # layers to offload to GPU (-1 = all)
+    model_path: str = ""
+    n_ctx: int = 4096
+    n_gpu_layers: int = -1
 
     # --- Performance ---
-    n_threads: int | None = None           # CPU threads for generation (None = auto)
-    n_threads_batch: int | None = None     # CPU threads for prompt eval (None = auto)
-    n_batch: int = 512                     # prompt processing batch size
-    n_ubatch: int = 512                    # physical batch size for computation
-    use_mmap: bool = True                  # memory-map model file (faster load, less RAM)
-    use_mlock: bool = False                # lock model in RAM (prevents swapping)
-    offload_kqv: bool = True               # offload KV cache to GPU
-    flash_attn: bool = False               # use flash attention (faster, less VRAM)
+    n_threads: int | None = None
+    n_threads_batch: int | None = None
+    n_batch: int = 512
+    n_ubatch: int = 512
+    use_mmap: bool = True
+    use_mlock: bool = False
+    offload_kqv: bool = True
+    flash_attn: bool = False
 
     # --- Context / Memory ---
-    logits_all: bool = False               # compute logits for all tokens (required for beam search)
+    logits_all: bool = False
 
     # --- RoPE / Extended Context ---
-    rope_freq_base: float = 0.0            # RoPE base frequency (0 = model default)
-    rope_freq_scale: float = 0.0           # RoPE frequency scaling factor (0 = model default)
-    rope_scaling_type: int = -1            # RoPE scaling type (-1 = model default)
-    yarn_ext_factor: float = -1.0          # YaRN extrapolation factor (-1 = model default)
-    yarn_attn_factor: float = 1.0          # YaRN attention scaling factor
-    yarn_beta_fast: float = 32.0           # YaRN beta fast
-    yarn_beta_slow: float = 1.0            # YaRN beta slow
-    yarn_orig_ctx: int = 0                 # original context size the model was trained with
+    rope_freq_base: float = 0.0
+    rope_freq_scale: float = 0.0
+    rope_scaling_type: int = -1
+    yarn_ext_factor: float = -1.0
+    yarn_attn_factor: float = 1.0
+    yarn_beta_fast: float = 32.0
+    yarn_beta_slow: float = 1.0
+    yarn_orig_ctx: int = 0
 
     # --- LoRA / Adapters ---
-    lora_path: str | None = None           # path to LoRA adapter file
-    lora_base: str | None = None           # path to base model for LoRA scaling
-    lora_scale: float = 1.0                # LoRA adapter strength
+    lora_path: str | None = None
+    lora_base: str | None = None
+    lora_scale: float = 1.0
 
     # --- Debug / Verbose ---
-    verbose: bool = False                  # print llama.cpp loading/inference logs
-    seed: int = -1                         # RNG seed (-1 = random)
+    verbose: bool = False
+    seed: int = -1
 
     # --- Multi-GPU ---
-    tensor_split: list | None = None       # fraction of model to put on each GPU
-    main_gpu: int = 0                      # GPU used for scratch and small tensors
-    split_mode: int = 1                    # how to split across GPUs (1 = layer, 2 = row)
+    tensor_split: list | None = None
+    main_gpu: int = 0
+    split_mode: int = 1
 
     # --- Speculative ---
-    draft_model: object | None = None      # smaller draft model for speculative decoding
+    draft_model: object | None = None
 
     def to_llama_kwargs(self, active_groups: list[str]) -> dict:
         """Build kwargs dict filtered by *active_groups*.
@@ -231,48 +296,48 @@ class GenerationConfig:
     """
 
     # --- Essential ---
-    max_tokens: int = 256              # maximum tokens to generate
-    temperature: float = 0.7           # randomness (0 = deterministic, higher = more random)
-    stop: list[str] | None = None      # stop generation when any of these strings appear
+    max_tokens: int = 256
+    temperature: float = 0.7
+    stop: list[str] | None = None
 
     # --- Sampling - basic ---
-    top_p: float = 0.95                # nucleus sampling: consider tokens covering top p% probability
-    top_k: int = 40                    # only sample from the top k tokens
-    repeat_penalty: float = 1.1        # penalise recently used tokens (1.0 = off)
+    top_p: float = 0.95
+    top_k: int = 40
+    repeat_penalty: float = 1.1
 
     # --- Sampling - advanced ---
-    min_p: float = 0.05                # minimum probability relative to the top token
-    typical_p: float = 1.0             # locally typical sampling threshold (1.0 = off)
-    tfs_z: float = 1.0                 # tail free sampling z-value (1.0 = off)
-    frequency_penalty: float = 0.0     # penalise tokens by how often they've appeared
-    presence_penalty: float = 0.0      # penalise tokens that have appeared at all
-    mirostat_mode: int = 0             # mirostat sampling version (0 = off, 1 or 2)
-    mirostat_tau: float = 5.0          # mirostat target entropy
-    mirostat_eta: float = 0.1          # mirostat learning rate
+    min_p: float = 0.05
+    typical_p: float = 1.0
+    tfs_z: float = 1.0
+    frequency_penalty: float = 0.0
+    presence_penalty: float = 0.0
+    mirostat_mode: int = 0
+    mirostat_tau: float = 5.0
+    mirostat_eta: float = 0.1
 
     # --- Constraints ---
-    grammar: object | None = None      # GBNF grammar object to constrain output format
-    logit_bias: dict | None = None     # manually adjust token probabilities {token_id: bias}
+    grammar: object | None = None
+    logit_bias: dict | None = None
 
     # --- Visibility / Debug ---
-    logprobs: int | None = None        # return log probabilities for top N tokens
-    stream: bool = True                # yield tokens as they are generated
-    echo: bool = False                 # include the prompt in the output
+    logprobs: int | None = None
+    stream: bool = True
+    echo: bool = False
 
     # --- Beam search ---
-    beam_width: int = 1                # number of beams (1 = standard greedy/sampling)
-    beam_depth: int = 0                # max steps for beam search (0 = use max_tokens)
-    length_penalty: float = 1.0        # normalise beam scores by length (1.0 = off)
-    beam_log_tree: bool = False        # print the full beam expansion tree
-    beam_top_results: int = 0          # how many beams to display (0 = beam_width)
+    beam_width: int = 1
+    beam_depth: int = 0
+    length_penalty: float = 1.0
+    beam_log_tree: bool = False
+    beam_top_results: int = 0
 
     # --- Branching ---
-    branch_at: int = 0                 # force an alternate token at this generation step
-    branch_pick: int = 0               # which rank alternative to pick at the branch point
+    branch_at: int = 0
+    branch_pick: int = 0
 
     # --- Chat template ---
-    chat_template: str = "none"        # template name (matches JSON filename stem, or "none")
-    system_prompt: str = ""            # system message content; empty = skip system block
+    chat_template: str = "none"
+    system_prompt: str = ""
 
     def to_generation_kwargs(self, active_groups: list[str]) -> dict:
         """Build kwargs dict filtered by *active_groups*.
