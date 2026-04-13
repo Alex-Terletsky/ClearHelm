@@ -13,7 +13,8 @@ A multithreaded local LLM runner built for deep visibility into model behavior, 
 
 - **Multi-agent management** — load any number of models simultaneously, each with independent configuration, state, and chat history
 - **Parameter group visibility** — 11 named groups (sampling, context extension, beam search, LoRA adapters, etc.) that can be toggled live; disabled groups are omitted from inference calls so the model uses its own defaults
-- **Named agent configs** — each agent's full configuration (model path, parameter groups, all loading and generation settings) is saved to `agents/<name>.json` and restored on startup
+- **Named agent configs** — each agent's full configuration (model path, parameter groups, all loading and generation settings) is saved to `agents/<slug>/config.json` and restored on startup
+- **Multi-turn conversations** — opt-in chat history that feeds prior turns back to the model using the chat template system, with configurable turn limits and session persistence
 - **Config presets** — reusable JSON presets in `configs/` that can be applied to any agent with one click
 - **Custom beam search** — full multi-beam search implemented over `llama-cpp-python`'s KV-cache state save/restore API, with live tree logging and configurable length penalty
 - **Branch-at-step** — force an alternate token at any specific generation step to explore different continuations from the same context
@@ -127,9 +128,9 @@ Output text is tagged at the source using XML-style markers (`<basic_log>`, `<ll
 
 ## Agents
 
-An agent is a named model instance with its own saved configuration. Agent configs are stored in `agents/<name>.json` and loaded automatically on startup.
+An agent is a named model instance with its own saved configuration. Agent configs are stored in `agents/<slug>/config.json` (where `<slug>` is a filesystem-safe version of the agent name) and loaded automatically on startup. Each agent directory also contains a `sessions/` folder for chat history persistence.
 
-*See: `core/src/ui/agents.py` — `_load_agent_configs()`, `_save_agent_config()`, `_delete_agent_config()`*
+*See: `core/src/ui/agents.py` — `_load_agent_configs()`, `_save_agent_config()`, `_delete_agent_config()`, `_resolve_session()`, `_save_session()`*
 
 **To add an agent:**
 1. Click **Add** in the sidebar
@@ -144,7 +145,7 @@ Select the agent in the sidebar and click **Load**. The model loads in the backg
 *See: `core/src/runner.py` — `RunnerService`, `RunnerService._run_loop()`, `ModelRunner.load()`*
 
 **To save an agent's current configuration:**
-Click **Save** in the sidebar. This writes the current parameter values and group toggles to `agents/<name>.json`.
+Click **Save** in the sidebar. This writes the current parameter values and group toggles to `agents/<slug>/config.json`.
 
 *See: `core/src/params.py` — `RunnerConfig.to_file()`*
 
@@ -329,7 +330,10 @@ ClearHelm/
 ├── modules/                # Drop-in module directory
 │   ├── README.md           # Module authoring guide
 │   └── message_agent.py    # Inter-agent routing module
-├── agents/                 # Saved agent configs (auto-created, gitignored)
+├── agents/                 # Per-agent subdirectories (auto-created, gitignored)
+│   └── <slug>/
+│       ├── config.json     # Agent configuration
+│       └── sessions/       # Chat history files
 ├── configs/                # Config presets
 │   ├── default.json
 │   ├── fullvis.json

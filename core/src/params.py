@@ -79,7 +79,7 @@ PARAMETER_GROUPS = {
     "visibility": {
         "description": "Debug and transparency options",
         "loading": ["verbose", "logits_all", "seed"],
-        "generation": ["logprobs", "stream", "echo"],
+        "generation": ["logprobs", "stream", "echo", "show_stats"],
     },
     "multi_gpu": {
         "description": "Multi-GPU configuration",
@@ -103,7 +103,12 @@ PARAMETER_GROUPS = {
     "chat": {
         "description": "Chat template and system prompt",
         "loading": [],
-        "generation": ["chat_template", "system_prompt"],
+        "generation": ["chat_template", "system_prompt", "use_history", "max_history_turns"],
+    },
+    "session": {
+        "description": "Chat session loading behavior",
+        "loading": [],
+        "generation": ["session_mode", "session_file"],
     },
 }
 
@@ -161,6 +166,7 @@ PARAM_META: dict[str, dict] = {
     "logprobs":         {"description": "Return log probabilities for top N tokens", "min": 0},
     "stream":           {"description": "Yield tokens as they are generated"},
     "echo":             {"description": "Include the prompt in the output"},
+    "show_stats":       {"description": "Generation stats display: \"always\", \"basic\" (log mode only), or \"off\""},
     "beam_width":       {"description": "Number of beams (1 = standard greedy/sampling)", "min": 1},
     "beam_depth":       {"description": "Max steps for beam search (0 = use max_tokens)", "min": 0},
     "length_penalty":   {"description": "Normalise beam scores by length (1.0 = off)", "min": 0.0, "step": 0.1, "decimals": 2},
@@ -170,6 +176,10 @@ PARAM_META: dict[str, dict] = {
     "branch_pick":      {"description": "Which rank alternative to pick at the branch point", "min": 0},
     "chat_template":    {"description": "Template name (matches JSON filename stem, or \"none\")"},
     "system_prompt":    {"description": "System message content; empty = skip system block"},
+    "use_history":      {"description": "Send prior conversation turns as context to the model"},
+    "max_history_turns": {"description": "Maximum user+assistant turn pairs to include", "min": 1, "max": 100},
+    "session_mode":     {"description": "Session init: \"new\" (empty), \"recent\" (latest file), \"file\" (specific path)"},
+    "session_file":     {"description": "Active session file path (auto-set, or manual for mode=file)"},
 }
 
 # Reverse lookups: param_name -> group_name
@@ -335,9 +345,20 @@ class GenerationConfig:
     branch_at: int = 0
     branch_pick: int = 0
 
+    # --- Stats ---
+    show_stats: str = "always"    # "always" | "basic" | "off"
+
     # --- Chat template ---
     chat_template: str = "none"
     system_prompt: str = ""
+
+    # --- Multi-turn history ---
+    use_history: bool = False
+    max_history_turns: int = 10
+
+    # --- Session ---
+    session_mode: str = "new"       # "new" | "recent" | "file"
+    session_file: str = ""
 
     def to_generation_kwargs(self, active_groups: list[str]) -> dict:
         """Build kwargs dict filtered by *active_groups*.

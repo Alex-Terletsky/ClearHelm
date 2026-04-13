@@ -564,6 +564,18 @@ class ParameterPanel(QWidget):
                 w.addItem(t["name"])
             w.setCurrentText(str(value))
             return w
+        if pname == "session_mode":
+            w = NoScrollComboBox()
+            for mode in ("new", "recent", "file"):
+                w.addItem(mode)
+            w.setCurrentText(str(value))
+            return w
+        if pname == "show_stats":
+            w = NoScrollComboBox()
+            for mode in ("always", "basic", "off"):
+                w.addItem(mode)
+            w.setCurrentText(str(value))
+            return w
         if pname == "system_prompt":
             w = QTextEdit()
             w.setPlainText(str(value) if value else "")

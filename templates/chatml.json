@@ -6,5 +6,6 @@
   "user_prefix": "<|im_start|>user\n",
   "user_suffix": "<|im_end|>\n",
   "assistant_prefix": "<|im_start|>assistant\n",
+  "assistant_suffix": "<|im_end|>\n",
   "stop_tokens": ["<|im_end|>"]
 }

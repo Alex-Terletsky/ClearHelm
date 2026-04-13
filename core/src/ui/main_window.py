@@ -23,7 +23,10 @@ from .constants import (
     DARK_STYLE, ECHO_NAME, MULTI_SESSION_RENDER_CAP,
 )
 from .widgets import SignalBridge
-from .agents import _load_agent_configs, _save_agent_config, _delete_agent_config
+from .agents import (
+    _load_agent_configs, _save_agent_config, _delete_agent_config,
+    _resolve_session, _save_session, _load_session_file,
+)
 from .sidebar import ModelSidebar
 from .parameter_panel import ParameterPanel
 from .module_panel import ModulePanel
@@ -38,14 +41,18 @@ class MainWindow(QMainWindow):
 
         self._bridge = SignalBridge()
         self._bridge.text_received.connect(self._on_text_received)
+        self._bridge.generation_complete.connect(self._on_generation_complete)
 
         self._manager = ModelManager(
             models_dir=_MODELS_DIR,
             config_path=_CONFIG_PATH,
             output_callback=self._manager_output,
+            completion_callback=self._manager_completion,
         )
 
         self._histories: dict[str, str] = {}
+        self._chat_histories: dict[str, list[dict]] = {}
+        self._session_paths: dict[str, str] = {}
         self._param_model: str | None = None
         self._log_mode: str = "output"   # "output" | "basic" | "verbose"
         self._agent_colors:    dict[str, QColor] = {}
@@ -174,6 +181,8 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
 
+        self._module_manager = None
+
         # ---- Signals ----
         self._sidebar.load_requested.connect(self._load_model)
         self._sidebar.unload_requested.connect(self._unload_model)
@@ -290,6 +299,16 @@ class MainWindow(QMainWindow):
             try:
                 self._manager.add_model(name, path, config=cfg)
                 self._histories[name] = ""
+                # Resolve session for this agent
+                gc = cfg.generation_config
+                history, resolved_path = _resolve_session(
+                    name, gc.session_mode, gc.session_file,
+                    log_fn=lambda text: self._manager_output("system", text),
+                )
+                if gc.use_history and history:
+                    self._chat_histories[name] = history
+                self._session_paths[name] = resolved_path
+                gc.session_file = resolved_path
                 self._sidebar.add_agent(name)
                 self._agent_colors[name] = self._assign_agent_color(name)
                 self._sidebar.set_agent_color(name, self._agent_colors[name].name())
@@ -326,6 +345,16 @@ class MainWindow(QMainWindow):
                           intercept_schemas=self._module_manager.intercept_schemas)
         self._manager.add_model(name, model["path"], config=config)
         self._histories[name] = ""
+        # Resolve session for the new agent
+        gc = config.generation_config
+        history, resolved_path = _resolve_session(
+            name, gc.session_mode, gc.session_file,
+            log_fn=lambda text: self._manager_output("system", text),
+        )
+        if gc.use_history and history:
+            self._chat_histories[name] = history
+        self._session_paths[name] = resolved_path
+        gc.session_file = resolved_path
         self._sidebar.add_agent(name)
         self._agent_colors[name] = self._assign_agent_color(name)
         self._sidebar.set_agent_color(name, self._agent_colors[name].name())
@@ -346,6 +375,8 @@ class MainWindow(QMainWindow):
         self._manager.remove_model(name)
         self._sidebar.remove_agent(name)
         self._histories.pop(name, None)
+        self._chat_histories.pop(name, None)
+        self._session_paths.pop(name, None)
         self._agent_colors.pop(name, None)
         self._all_events = [(n, t) for n, t in self._all_events if n != name]
         if self._multi_view_active:
@@ -396,13 +427,26 @@ class MainWindow(QMainWindow):
             self._save_agent(name)
 
     def _on_param_apply(self):
-        """Post-apply hook: sync active groups to the RunnerService."""
+        """Post-apply hook: sync active groups and session path to the RunnerService."""
         name = self._param_model
         if not name:
             return
         try:
             groups = self._param_panel.active_groups()
             self._manager.update_active_groups(name, groups)
+        except KeyError:
+            pass
+        # Redirect session if session_file changed — load new history + redirect saves
+        try:
+            cfg = self._manager.get_config(name)
+            new_path = cfg.generation_config.session_file
+            if new_path and new_path != self._session_paths.get(name):
+                self._session_paths[name] = new_path
+                history = _load_session_file(new_path)
+                if history:
+                    self._chat_histories[name] = history
+                else:
+                    self._chat_histories.pop(name, None)
         except KeyError:
             pass
 
@@ -671,12 +715,32 @@ class MainWindow(QMainWindow):
     def _manager_output(self, model_name: str, text: str):
         self._bridge.text_received.emit(model_name, text)
 
+    def _manager_completion(self, model_name: str, response: str):
+        self._bridge.generation_complete.emit(model_name, response)
+
+    def _on_generation_complete(self, model_name: str, response: str):
+        """Store the clean assistant response in chat history and persist."""
+        try:
+            cfg = self._manager.get_config(model_name)
+            if not cfg.generation_config.use_history:
+                return
+        except KeyError:
+            return
+        hist = self._chat_histories.get(model_name)
+        if hist is None:
+            return
+        hist.append({"role": "assistant", "content": response.strip()})
+        session_path = self._session_paths.get(model_name)
+        if session_path:
+            _save_session(model_name, session_path, hist)
+
     def _on_text_received(self, model_name: str, text: str):
         if model_name not in self._histories:
             self._histories[model_name] = ""
         self._histories[model_name] += text
         self._all_events.append((model_name, text))
-        self._module_manager.on_output(model_name, text)
+        if self._module_manager is not None:
+            self._module_manager.on_output(model_name, text)
 
         if self._multi_view_active:
             if model_name not in self._multi_checked:
@@ -752,7 +816,18 @@ class MainWindow(QMainWindow):
         if active == ECHO_NAME:
             self._manager_output(ECHO_NAME, prompt + "\n")
         else:
-            self._manager.submit_prompt(prompt, model_name=active)
+            # Only accumulate history when use_history is enabled
+            history_arg = None
+            try:
+                cfg = self._manager.get_config(active)
+                use_history = cfg.generation_config.use_history
+            except KeyError:
+                use_history = False
+            if use_history:
+                self._chat_histories.setdefault(active, [])
+                self._chat_histories[active].append({"role": "user", "content": prompt})
+                history_arg = self._chat_histories[active][:-1]  # prior turns only
+            self._manager.submit_prompt(prompt, model_name=active, history=history_arg)
 
     # ---- Status polling ----
 

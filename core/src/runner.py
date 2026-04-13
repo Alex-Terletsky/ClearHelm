@@ -22,7 +22,10 @@ from params import (
     ModelConfig, GenerationConfig, RunnerConfig,
     ParameterVisibility,
 )
-from chat_format import apply_template, get_stop_tokens, load_template
+from chat_format import (
+    apply_template, apply_multiturn_template, trim_history,
+    get_stop_tokens, load_template,
+)
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 _TEMPLATES_DIR = os.path.join(os.path.dirname(os.path.dirname(_SRC_DIR)), "templates")
@@ -185,7 +188,8 @@ class ModelRunner:
         self._log(f"Loaded in {load_time:.2f}s")
 
     def generate(self, prompt: str,
-                 gen_config: GenerationConfig | None = None):
+                 gen_config: GenerationConfig | None = None,
+                 history: list[dict] | None = None):
         """Generate with full visibility based on active parameter groups."""
         if gen_config is None:
             gen_config = GenerationConfig()
@@ -207,19 +211,45 @@ class ModelRunner:
         branch_at = kwargs.pop("branch_at", 0)
         branch_pick = kwargs.pop("branch_pick", 0)
 
+        # Stats display
+        show_stats = kwargs.pop("show_stats", "always")
+
         # Chat template params -- not passed to llama-cpp
         chat_template_name = kwargs.pop("chat_template", "none")
         system_prompt = kwargs.pop("system_prompt", "")
 
+        # Multi-turn history params -- not passed to llama-cpp
+        use_history = kwargs.pop("use_history", False)
+        max_history_turns = kwargs.pop("max_history_turns", 10)
+
+        # Session params -- used at load time in main_window; pop to keep out of llama kwargs
+        kwargs.pop("session_mode", None)
+        kwargs.pop("session_file", None)
+
         if chat_template_name != "none":
             template = load_template(_TEMPLATES_DIR, chat_template_name)
-            prompt = apply_template(template, system_prompt, prompt)
-            self._basic_log(f"Chat template: {chat_template_name}")
+            if use_history and history:
+                trimmed = trim_history(history, max_history_turns)
+                prompt = apply_multiturn_template(template, system_prompt, trimmed, prompt)
+                self._basic_log(f"Chat template (multi-turn, {len(trimmed)} turns): {chat_template_name}")
+            else:
+                prompt = apply_template(template, system_prompt, prompt)
+                self._basic_log(f"Chat template: {chat_template_name}")
             if not kwargs.get("stop"):
                 auto_stop = get_stop_tokens(template)
                 if auto_stop:
                     kwargs["stop"] = auto_stop
                     self._basic_log(f"Auto-stop tokens: {auto_stop}")
+
+        # Context window warning for multi-turn prompts
+        if use_history and history and self.llm is not None:
+            n_ctx = self.model_config.n_ctx
+            prompt_tokens = self.llm.tokenize(prompt.encode())
+            usage = len(prompt_tokens) / n_ctx if n_ctx > 0 else 0
+            if usage > 0.9:
+                self._log(f"WARNING: prompt uses {usage:.0%} of context window "
+                          f"({len(prompt_tokens)}/{n_ctx} tokens). "
+                          f"Consider reducing max_history_turns.")
 
         if beam_width > 1:
             max_tokens = kwargs.pop("max_tokens", 256)
@@ -244,14 +274,17 @@ class ModelRunner:
         generated_tokens = 0
         full_response = ""
 
+        _router = _StdoutRouter(self._output_callback)
         if do_stream:
-            for chunk in self.llm(prompt, stream=True, echo=do_echo, **kwargs):
-                token_text = chunk["choices"][0]["text"]
-                full_response += token_text
-                generated_tokens += 1
-                self._emit(token_text)
+            with _redirect_stdout(_router), _redirect_stderr(_router):
+                for chunk in self.llm(prompt, stream=True, echo=do_echo, **kwargs):
+                    token_text = chunk["choices"][0]["text"]
+                    full_response += token_text
+                    generated_tokens += 1
+                    self._emit(token_text)
         else:
-            result = self.llm(prompt, echo=do_echo, **kwargs)
+            with _redirect_stdout(_router), _redirect_stderr(_router):
+                result = self.llm(prompt, echo=do_echo, **kwargs)
             full_response = result["choices"][0]["text"]
             generated_tokens = result["usage"]["completion_tokens"]
             self._emit(full_response)
@@ -262,11 +295,18 @@ class ModelRunner:
         elapsed = time.time() - start
         tps = generated_tokens / elapsed if elapsed > 0 else 0
 
-        self._emit(f"{'-'*40}\n")
-        self._log("STATS:")
-        self._emit(f"  Output tokens: {generated_tokens}\n")
-        self._emit(f"  Time: {elapsed:.2f}s\n")
-        self._emit(f"  Speed: {tps:.1f} tok/s\n")
+        if show_stats == "always":
+            self._emit(f"{'-'*40}\n")
+            self._log("STATS:")
+            self._emit(f"  Output tokens: {generated_tokens}\n")
+            self._emit(f"  Time: {elapsed:.2f}s\n")
+            self._emit(f"  Speed: {tps:.1f} tok/s\n")
+        elif show_stats == "basic":
+            self._basic_emit(f"{'-'*40}\n")
+            self._basic_log("STATS:")
+            self._basic_emit(f"  Output tokens: {generated_tokens}\n")
+            self._basic_emit(f"  Time: {elapsed:.2f}s\n")
+            self._basic_emit(f"  Speed: {tps:.1f} tok/s\n")
 
         self.stats = {
             "input_tokens": len(tokens),
@@ -550,9 +590,11 @@ _SHUTDOWN_SENTINEL = object()
 
 class RunnerService:
     def __init__(self, config: RunnerConfig,
-                 output_callback: Callable[[str], None] | None = None):
+                 output_callback: Callable[[str], None] | None = None,
+                 completion_callback: Callable[[str], None] | None = None):
         self._config = config
         self._output_callback = output_callback or print
+        self._completion_callback = completion_callback
         self._queue: queue.Queue = queue.Queue()
         self._state = ServiceState.IDLE
         self._state_lock = threading.Lock()
@@ -607,7 +649,8 @@ class RunnerService:
             self._thread = None
 
     def submit_prompt(self, prompt: str,
-                      gen_config: GenerationConfig | None = None):
+                      gen_config: GenerationConfig | None = None,
+                      history: list[dict] | None = None):
         if self.state != ServiceState.READY:
             self._output_callback(
                 f"<basic_log>[service] Cannot submit: state is {self.state.value}\n</basic_log>"
@@ -616,6 +659,7 @@ class RunnerService:
         self._queue.put({
             "prompt": prompt,
             "gen_config": gen_config or self._config.generation_config,
+            "history": history or [],
         })
 
     def _run_loop(self):
@@ -636,10 +680,13 @@ class RunnerService:
                     break
                 try:
                     self.state = ServiceState.GENERATING
-                    self._runner.generate(
+                    response = self._runner.generate(
                         prompt=item["prompt"],
                         gen_config=item["gen_config"],
+                        history=item.get("history", []),
                     )
+                    if self._completion_callback and response is not None:
+                        self._completion_callback(response)
                 except Exception as e:
                     self._output_callback(
                         f"\n[service] Generation error: {e}\n"

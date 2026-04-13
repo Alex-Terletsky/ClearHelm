@@ -35,4 +35,5 @@ class NoScrollComboBox(_NoScrollMixin, QComboBox):
 
 class SignalBridge(QObject):
     """Emits Qt signals from arbitrary threads so the UI can safely update."""
-    text_received = Signal(str, str)   # (model_name, text)
+    text_received = Signal(str, str)        # (model_name, text)
+    generation_complete = Signal(str, str)  # (model_name, full_response)

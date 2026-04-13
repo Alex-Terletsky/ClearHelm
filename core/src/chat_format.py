@@ -61,6 +61,39 @@ def apply_template(template: dict, system_prompt: str, user_message: str) -> str
     return "".join(parts)
 
 
+def apply_multiturn_template(
+    template: dict,
+    system_prompt: str,
+    history: list[dict],
+    user_message: str,
+) -> str:
+    """Build a multi-turn prompt from prior conversation turns.
+
+    *history* is ``[{"role": "user"|"assistant", "content": str}, ...]``.
+    An empty *history* produces output identical to ``apply_template()``.
+    """
+    assistant_suffix = template.get("assistant_suffix", "")
+    parts = []
+    if system_prompt:
+        parts.append(template["system_prefix"] + system_prompt + template["system_suffix"])
+    for turn in history:
+        if turn["role"] == "user":
+            parts.append(template["user_prefix"] + turn["content"] + template["user_suffix"])
+        elif turn["role"] == "assistant":
+            parts.append(template["assistant_prefix"] + turn["content"] + assistant_suffix)
+    parts.append(template["user_prefix"] + user_message + template["user_suffix"])
+    parts.append(template["assistant_prefix"])
+    return "".join(parts)
+
+
+def trim_history(history: list[dict], max_turns: int) -> list[dict]:
+    """Keep the last *max_turns* complete user+assistant pairs."""
+    h = history[-(max_turns * 2):]
+    if h and h[0]["role"] != "user":
+        h = h[1:]
+    return h
+
+
 def get_stop_tokens(template: dict) -> list[str]:
     """Return the template's stop token list (may be empty)."""
     return list(template.get("stop_tokens", []))

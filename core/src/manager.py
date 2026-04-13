@@ -61,7 +61,8 @@ class ModelManager:
     """Manages multiple RunnerService instances."""
 
     def __init__(self, models_dir: str, config_path: str = "",
-                 output_callback: Callable[[str, str], None] | None = None):
+                 output_callback: Callable[[str, str], None] | None = None,
+                 completion_callback: Callable[[str, str], None] | None = None):
         """
         Parameters
         ----------
@@ -73,10 +74,13 @@ class ModelManager:
         output_callback : callable(model_name, text)
             Receives ``(model_name, text)`` for every chunk of output
             from any managed service.
+        completion_callback : callable(model_name, response)
+            Called once per generation with the full response text.
         """
         self.models_dir = models_dir
         self.config_path = config_path
         self._output_callback = output_callback or self._default_output
+        self._completion_callback = completion_callback
         self._services: dict[str, RunnerService] = {}
         self._configs: dict[str, RunnerConfig] = {}
         self._active: str | None = None
@@ -91,6 +95,14 @@ class ModelManager:
         """Return a single-arg callback that tags output with *name*."""
         def _cb(text: str):
             self._output_callback(name, text)
+        return _cb
+
+    def _make_completion_callback(self, name: str):
+        """Return a single-arg callback that tags completion with *name*."""
+        if self._completion_callback is None:
+            return None
+        def _cb(response: str):
+            self._completion_callback(name, response)
         return _cb
 
     # ---- Discovery ----
@@ -114,6 +126,7 @@ class ModelManager:
         svc = RunnerService(
             config=config,
             output_callback=self._make_service_callback(name),
+            completion_callback=self._make_completion_callback(name),
         )
         self._services[name] = svc
         self._configs[name] = config
@@ -157,7 +170,8 @@ class ModelManager:
 
     # ---- Prompt routing ----
 
-    def submit_prompt(self, prompt: str, model_name: str | None = None):
+    def submit_prompt(self, prompt: str, model_name: str | None = None,
+                      history: list[dict] | None = None):
         """Route a prompt to the active (or specified) model."""
         target = model_name or self._active
         if target is None:
@@ -167,7 +181,7 @@ class ModelManager:
         if svc is None:
             self._output_callback("system", f"Unknown model: {target}\n")
             return
-        svc.submit_prompt(prompt)
+        svc.submit_prompt(prompt, history=history)
 
     # ---- Status / introspection ----
 
