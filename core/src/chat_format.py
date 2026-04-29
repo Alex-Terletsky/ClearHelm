@@ -13,6 +13,23 @@ _REQUIRED_KEYS = {
     "user_prefix", "user_suffix", "assistant_prefix",
 }
 
+
+def _extract_text(content) -> str:
+    """Extract text from content that may be a string or a list of content blocks.
+
+    Handles both plain string content and OpenAI-style content arrays
+    (e.g. [{"type": "text", "text": "..."}, {"type": "image_path", ...}]).
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return " ".join(parts) if parts else ""
+    return str(content)
+
 # Module-level cache: {abs_path: parsed_dict}
 _template_cache: dict[str, dict] = {}
 
@@ -77,10 +94,11 @@ def apply_multiturn_template(
     if system_prompt:
         parts.append(template["system_prefix"] + system_prompt + template["system_suffix"])
     for turn in history:
+        text = _extract_text(turn["content"])
         if turn["role"] == "user":
-            parts.append(template["user_prefix"] + turn["content"] + template["user_suffix"])
+            parts.append(template["user_prefix"] + text + template["user_suffix"])
         elif turn["role"] == "assistant":
-            parts.append(template["assistant_prefix"] + turn["content"] + assistant_suffix)
+            parts.append(template["assistant_prefix"] + text + assistant_suffix)
     parts.append(template["user_prefix"] + user_message + template["user_suffix"])
     parts.append(template["assistant_prefix"])
     return "".join(parts)

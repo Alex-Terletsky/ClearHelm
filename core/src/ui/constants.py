@@ -77,7 +77,7 @@ QMainWindow, QWidget {
 QLabel {
     color: #cdd6f4;
 }
-QLineEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {
     background-color: #313244;
     color: #cdd6f4;
     border: 1px solid #45475a;

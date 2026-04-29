@@ -171,7 +171,8 @@ class ModelManager:
     # ---- Prompt routing ----
 
     def submit_prompt(self, prompt: str, model_name: str | None = None,
-                      history: list[dict] | None = None):
+                      history: list[dict] | None = None,
+                      images: list[str] | None = None):
         """Route a prompt to the active (or specified) model."""
         target = model_name or self._active
         if target is None:
@@ -181,7 +182,7 @@ class ModelManager:
         if svc is None:
             self._output_callback("system", f"Unknown model: {target}\n")
             return
-        svc.submit_prompt(prompt, history=history)
+        svc.submit_prompt(prompt, history=history, images=images)
 
     # ---- Status / introspection ----
 

@@ -49,6 +49,36 @@ MODELS = [
         "filename": "Qwen2.5-1.5B-Instruct-Q8_0.gguf",
         "description": "Qwen2.5 1.5B Instruct - Q8_0 quantization (1.65 GB)",
     },
+    {
+        # https://huggingface.co/unsloth/gemma-4-31B-it-GGUF
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "gemma-4-31B-it-Q4_K_M.gguf",
+        "description": "Gemma 4 31B Instruct - Q4_K_M quantization (~18.3 GB, faster inference)",
+    },
+    {
+        # https://huggingface.co/unsloth/gemma-4-31B-it-GGUF (vision projector)
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "mmproj-F16.gguf",
+        "description": "Gemma 4 31B - Multimodal vision projector F16",
+    },
+    {
+        # https://huggingface.co/unsloth/gemma-4-31B-it-GGUF
+        "repo_id": "unsloth/gemma-4-31B-it-GGUF",
+        "filename": "gemma-4-31B-it-Q8_0.gguf",
+        "description": "Gemma 4 31B Instruct - Q8_0 quantization (~32.6 GB)",
+    },
+    {
+        # https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF
+        "repo_id": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "gemma-4-E4B-it-Q8_0.gguf",
+        "description": "Gemma 4 E4B Instruct - Q8_0 quantization (~4B effective params)",
+    },
+    {
+        # https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF (vision projector)
+        "repo_id": "unsloth/gemma-4-E4B-it-GGUF",
+        "filename": "mmproj-F16.gguf",
+        "description": "Gemma 4 E4B - Multimodal vision projector F16",
+    },
 ]
 
 
@@ -87,7 +117,6 @@ def download_models():
                 repo_id=repo_id,
                 filename=filename,
                 local_dir=MODELS_DIR,
-                local_dir_use_symlinks=False,
             )
             print(f"[DONE] Saved to: {downloaded_path}")
         except Exception as e:

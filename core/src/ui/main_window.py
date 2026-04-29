@@ -1,15 +1,20 @@
 import os
+import re
 import sys
+import time as _time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QSplitter,
     QVBoxLayout, QHBoxLayout,
-    QPushButton, QTextEdit, QLineEdit,
+    QPushButton, QTextEdit, QLabel,
     QDialog, QFileDialog, QMessageBox,
     QButtonGroup,
 )
-from PySide6.QtGui import QColor, QTextCursor, QFont, QTextCharFormat
+from PySide6.QtGui import (
+    QColor, QTextCursor, QFont, QTextCharFormat,
+    QImage,
+)
 
 from params import RunnerConfig
 from runner import ServiceState
@@ -22,7 +27,7 @@ from .constants import (
     _BASIC_COLOR, _VERBOSE_COLOR, _DEFAULT_COLOR, _parse_segment,
     DARK_STYLE, ECHO_NAME, MULTI_SESSION_RENDER_CAP,
 )
-from .widgets import SignalBridge
+from .widgets import SignalBridge, PromptInput, ImageThumbnail
 from .agents import (
     _load_agent_configs, _save_agent_config, _delete_agent_config,
     _resolve_session, _save_session, _load_session_file,
@@ -30,7 +35,7 @@ from .agents import (
 from .sidebar import ModelSidebar
 from .parameter_panel import ParameterPanel
 from .module_panel import ModulePanel
-from .dialogs import AddAgentDialog
+from .dialogs import AddAgentDialog, ImagePreviewDialog
 
 
 class MainWindow(QMainWindow):
@@ -58,6 +63,7 @@ class MainWindow(QMainWindow):
         self._agent_colors:    dict[str, QColor] = {}
         self._all_events:      list[tuple[str, str | None]] = []  # (name, text) or (name, None) = session marker
         self._current_chat: str = ""
+        self._pending_images: list[str] = []
         self._multi_view_active: bool = False
         self._multi_checked: list[str] = []
         self._session_cursors: list[QTextCursor] = []
@@ -142,18 +148,39 @@ class MainWindow(QMainWindow):
 
         console_layout.addWidget(self._output, stretch=1)
 
+        # Thumbnail preview strip (hidden when empty)
+        self._thumb_row = QHBoxLayout()
+        self._thumb_row.setContentsMargins(0, 0, 0, 0)
+        self._thumb_widget = QWidget()
+        self._thumb_widget.setLayout(self._thumb_row)
+        self._thumb_widget.hide()
+        console_layout.addWidget(self._thumb_widget)
+
         input_row = QHBoxLayout()
-        self._input = QLineEdit()
-        self._input.setPlaceholderText("Select an agent to begin...")
-        self._input.setFont(QFont("Consolas", 11))
+        input_row.setContentsMargins(0, 0, 0, 4)
+        self._btn_attach = QPushButton("+")
+        self._btn_attach.setToolTip("Attach Image")
+        self._btn_attach.setStyleSheet(
+            "QPushButton { background-color: #45475a; color: #cdd6f4; "
+            "font-weight: bold; font-size: 14px; border-radius: 4px; "
+            "padding: 5px 10px; }"
+            "QPushButton:hover { background-color: #585b70; }"
+        )
+        self._btn_attach.clicked.connect(self._attach_image)
         self._btn_send = QPushButton("Send")
         self._btn_send.setStyleSheet(
             "QPushButton { background-color: #89b4fa; color: #1e1e2e; "
             "font-weight: bold; }"
             "QPushButton:hover { background-color: #b4d0fb; }"
         )
+        self._input = PromptInput(max_lines=4, match_widget=self._btn_send)
+        self._input.setPlaceholderText("Select an agent to begin...")
+        self._input.setFont(QFont("Consolas", 11))
+        self._input.setAcceptDrops(True)
+        self._input.installEventFilter(self)
+        input_row.addWidget(self._btn_attach, alignment=Qt.AlignBottom)
         input_row.addWidget(self._input, stretch=1)
-        input_row.addWidget(self._btn_send)
+        input_row.addWidget(self._btn_send, alignment=Qt.AlignBottom)
         console_layout.addLayout(input_row)
 
         # Parameter panel (now manages its own scroll area)
@@ -192,7 +219,7 @@ class MainWindow(QMainWindow):
         self._sidebar.multi_view_changed.connect(self._on_multi_view_changed)
         self._sidebar.multi_selection_changed.connect(self._on_multi_selection_changed)
         self._btn_send.clicked.connect(self._send_prompt)
-        self._input.returnPressed.connect(self._send_prompt)
+        self._input.submitted.connect(self._send_prompt)
         self._log_btn_group.idClicked.connect(self._on_log_mode_changed)
         self._btn_drawer.clicked.connect(self._on_drawer_toggled)
         self._module_panel.badge_changed.connect(self._on_badge_changed)
@@ -768,11 +795,144 @@ class MainWindow(QMainWindow):
             self._output.setTextCursor(cursor)
             self._output.ensureCursorVisible()
 
+    # ---- Image attachment ----
+
+    _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
+    _PATH_RE = re.compile(
+        r'"([^"]+\.(?:png|jpe?g|gif|bmp|webp))"'   # quoted path
+        r'|'
+        r'(\S+\.(?:png|jpe?g|gif|bmp|webp))',        # unquoted path
+        re.IGNORECASE,
+    )
+
+    def _attach_image(self):
+        """Open file picker to attach an image."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Attach Image", "",
+            "Images (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;All Files (*)",
+        )
+        if path:
+            self._add_pending_image(path)
+
+    def _add_pending_image(self, path: str):
+        """Add an image path to pending attachments and update thumbnail strip."""
+        if path in self._pending_images:
+            return
+        self._pending_images.append(path)
+        self._refresh_thumbnails()
+
+    def _remove_pending_image(self, path: str):
+        """Remove an image from pending attachments."""
+        if path in self._pending_images:
+            self._pending_images.remove(path)
+            self._refresh_thumbnails()
+
+    def _refresh_thumbnails(self):
+        """Rebuild the thumbnail preview strip."""
+        while self._thumb_row.count():
+            item = self._thumb_row.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        if not self._pending_images:
+            self._thumb_widget.hide()
+            return
+
+        for img_path in self._pending_images:
+            thumb = ImageThumbnail(img_path)
+            thumb.removed.connect(self._remove_pending_image)
+            thumb.clicked.connect(self._preview_image)
+            self._thumb_row.addWidget(thumb)
+
+        self._thumb_row.addStretch()
+        self._thumb_widget.show()
+
+    def _preview_image(self, path: str):
+        """Open a full-size preview of an attached image."""
+        dlg = ImagePreviewDialog(path, self)
+        dlg.exec()
+
+    def _clear_pending_images(self):
+        """Clear all pending images and hide thumbnail strip."""
+        self._pending_images.clear()
+        self._refresh_thumbnails()
+
+    def _extract_image_paths(self, text: str) -> tuple[str, list[str]]:
+        """Scan text for image file paths. Returns (cleaned_text, found_paths)."""
+        found = []
+        def _replace(m):
+            path = m.group(1) or m.group(2)
+            if os.path.isfile(path):
+                found.append(path)
+                return ""  # strip from text
+            return m.group(0)  # leave as-is
+        cleaned = self._PATH_RE.sub(_replace, text).strip()
+        return cleaned, found
+
+    def _save_clipboard_image(self, image: QImage) -> str | None:
+        """Save a clipboard QImage to the active agent's session images dir."""
+        active = self._current_chat
+        if not active:
+            return None
+        from .constants import _AGENTS_DIR
+        img_dir = os.path.join(_AGENTS_DIR, active, "sessions", "images")
+        os.makedirs(img_dir, exist_ok=True)
+        ts = _time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(img_dir, f"paste_{ts}.png")
+        image.save(path, "PNG")
+        return path
+
+    def eventFilter(self, obj, event):
+        """Handle clipboard paste and drag-drop on the input field."""
+        if obj is self._input:
+            if event.type() == QEvent.KeyPress:
+                if event.key() == Qt.Key_V and event.modifiers() & Qt.ControlModifier:
+                    clipboard = QApplication.clipboard()
+                    mime = clipboard.mimeData()
+                    if mime.hasImage():
+                        image = clipboard.image()
+                        if not image.isNull():
+                            path = self._save_clipboard_image(image)
+                            if path:
+                                self._add_pending_image(path)
+                                return True  # consumed
+                    # Fall through to default paste for text
+            elif event.type() == QEvent.DragEnter:
+                mime = event.mimeData()
+                if mime.hasUrls():
+                    for url in mime.urls():
+                        if url.isLocalFile():
+                            ext = os.path.splitext(url.toLocalFile())[1].lower()
+                            if ext in self._IMAGE_EXTENSIONS:
+                                event.acceptProposedAction()
+                                return True
+                if mime.hasImage():
+                    event.acceptProposedAction()
+                    return True
+            elif event.type() == QEvent.Drop:
+                mime = event.mimeData()
+                if mime.hasUrls():
+                    for url in mime.urls():
+                        if url.isLocalFile():
+                            path = url.toLocalFile()
+                            ext = os.path.splitext(path)[1].lower()
+                            if ext in self._IMAGE_EXTENSIONS:
+                                self._add_pending_image(path)
+                    return True
+                if mime.hasImage():
+                    image = QImage(mime.imageData())
+                    if not image.isNull():
+                        path = self._save_clipboard_image(image)
+                        if path:
+                            self._add_pending_image(path)
+                    return True
+        return super().eventFilter(obj, event)
+
     # ---- Prompt submission ----
 
     def _send_prompt(self):
         prompt = self._input.text().strip()
-        if not prompt:
+        if not prompt and not self._pending_images:
             return
         active = self._current_chat
         if not active:
@@ -782,6 +942,10 @@ class MainWindow(QMainWindow):
             self._input.clear()
             return
 
+        # Auto-detect image paths in message text
+        prompt, detected_paths = self._extract_image_paths(prompt)
+        all_images = list(self._pending_images) + detected_paths
+
         if active != ECHO_NAME:
             groups = self._param_panel.active_groups()
             try:
@@ -790,7 +954,14 @@ class MainWindow(QMainWindow):
                 pass
 
         self._input.clear()
-        echo = f"\n> {prompt}\n"
+        self._clear_pending_images()
+
+        # Build echo with image indicators
+        if all_images:
+            img_names = [os.path.basename(p) for p in all_images]
+            echo = f"\n> {prompt}\n  [{len(all_images)} image(s): {', '.join(img_names)}]\n"
+        else:
+            echo = f"\n> {prompt}\n"
         self._histories.setdefault(active, "")
         self._histories[active] += echo
         self._all_events.append((active, None))    # session marker
@@ -818,6 +989,7 @@ class MainWindow(QMainWindow):
         else:
             # Only accumulate history when use_history is enabled
             history_arg = None
+            images_arg = all_images if all_images else None
             try:
                 cfg = self._manager.get_config(active)
                 use_history = cfg.generation_config.use_history
@@ -825,9 +997,18 @@ class MainWindow(QMainWindow):
                 use_history = False
             if use_history:
                 self._chat_histories.setdefault(active, [])
-                self._chat_histories[active].append({"role": "user", "content": prompt})
+                # Store image references as content blocks in history
+                if all_images:
+                    content: list[dict] = [{"type": "text", "text": prompt}]
+                    for img_path in all_images:
+                        content.append({"type": "image_path", "path": img_path})
+                    self._chat_histories[active].append({"role": "user", "content": content})
+                else:
+                    self._chat_histories[active].append({"role": "user", "content": prompt})
                 history_arg = self._chat_histories[active][:-1]  # prior turns only
-            self._manager.submit_prompt(prompt, model_name=active, history=history_arg)
+            self._manager.submit_prompt(
+                prompt, model_name=active, history=history_arg, images=images_arg,
+            )
 
     # ---- Status polling ----
 

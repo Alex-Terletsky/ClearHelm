@@ -1,0 +1,11 @@
+{
+  "name": "gemma",
+  "description": "Gemma turn-based format (Gemma 1/2/3/4). Note: Gemma has no native system role — system_prompt is emitted as bare text before the first user turn.",
+  "system_prefix": "",
+  "system_suffix": "\n\n",
+  "user_prefix": "<start_of_turn>user\n",
+  "user_suffix": "<end_of_turn>\n",
+  "assistant_prefix": "<start_of_turn>model\n",
+  "assistant_suffix": "<end_of_turn>\n",
+  "stop_tokens": ["<end_of_turn>", "<eos>"]
+}

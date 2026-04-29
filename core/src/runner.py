@@ -4,8 +4,6 @@ ModelRunner loads a .gguf model via llama-cpp-python and handles inference
 (standard generation, beam search, branch-at-step). RunnerService wraps it
 in a background thread with a state machine and prompt queue.
 """
-import ctypes
-import io
 import os
 import queue
 import threading
@@ -14,7 +12,6 @@ from contextlib import redirect_stdout as _redirect_stdout, redirect_stderr as _
 from enum import Enum
 from typing import Callable
 
-import llama_cpp
 import numpy as np
 from llama_cpp import Llama
 
@@ -25,6 +22,11 @@ from params import (
 from chat_format import (
     apply_template, apply_multiturn_template, trim_history,
     get_stop_tokens, load_template,
+)
+from llama_logs import (
+    FdStderrCapture, StdoutRouter, LOG_CATEGORY_FIELDS,
+    register_thread_runner, unregister_thread_runner,
+    reinstall_log_callback,
 )
 
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -41,59 +43,6 @@ def _next_runner_index() -> int:
         idx = _runner_counter
         _runner_counter += 1
         return idx
-
-
-_LLAMA_LOG_LEVEL_NAMES = {2: "error", 3: "warn", 4: "info"}
-
-# Thread-keyed log routing: each RunnerService thread registers its ModelRunner here.
-# The global callback dispatches to the runner on the calling thread, so logs from
-# one agent never appear under another even when multiple agents are loaded.
-_thread_log_map: dict[int, "ModelRunner"] = {}
-_thread_log_lock = threading.Lock()
-
-
-@llama_cpp.llama_log_callback
-def _global_llama_log_cb(level, message, user_data):
-    """Single global llama.cpp log callback; dispatches by calling thread."""
-    tid = threading.get_ident()
-    with _thread_log_lock:
-        runner = _thread_log_map.get(tid)
-    if runner is None:
-        return
-    try:
-        msg = message.decode("utf-8", errors="replace").strip()
-    except Exception:
-        return
-    if not msg:
-        return
-    if level > 3 and not runner.model_config.verbose:
-        return
-    level_name = _LLAMA_LOG_LEVEL_NAMES.get(level, str(level))
-    runner._output_callback(
-        f'\n<llama_cpp model="{runner.name}" index="{runner._runner_index}"'
-        f' level="{level_name}">{msg}</llama_cpp>'
-    )
-
-
-llama_cpp.llama_log_set(_global_llama_log_cb, ctypes.c_void_p(0))
-
-
-# ---- Model runner ----
-
-
-class _StdoutRouter(io.StringIO):
-    """Captures stdout and forwards each line to output_fn as a basic_log chunk."""
-    def __init__(self, output_fn):
-        super().__init__()
-        self._output_fn = output_fn
-
-    def write(self, s: str) -> int:
-        if s and s != '\n':
-            self._output_fn(f"<basic_log>{s}\n</basic_log>")
-        return len(s)
-
-    def flush(self):
-        pass
 
 
 def _log_softmax(scores: np.ndarray):
@@ -122,6 +71,7 @@ class ModelRunner:
         self.model_config = model_config
         self.active_groups = active_groups or ["essential"]
         self.llm = None
+        self._has_vision = False
         self.stats: dict = {}
         self._output_callback = output_callback or print
         self._runner_index = _next_runner_index()
@@ -151,6 +101,46 @@ class ModelRunner:
         """Raw diagnostic text shown in Basic/Verbose modes only."""
         self._output_callback(f"<basic_log>{text}</basic_log>")
 
+    def _emit_stats(self, generated_tokens: int, elapsed: float,
+                    show_stats: str) -> None:
+        """Emit generation stats based on the show_stats setting."""
+        tps = generated_tokens / elapsed if elapsed > 0 else 0
+        if show_stats == "always":
+            self._emit(f"{'-'*40}\n")
+            self._log("STATS:")
+            self._emit(f"  Output tokens: {generated_tokens}\n")
+            self._emit(f"  Time: {elapsed:.2f}s\n")
+            self._emit(f"  Speed: {tps:.1f} tok/s\n")
+        elif show_stats == "basic":
+            self._basic_emit(f"{'-'*40}\n")
+            self._basic_log("STATS:")
+            self._basic_emit(f"  Output tokens: {generated_tokens}\n")
+            self._basic_emit(f"  Time: {elapsed:.2f}s\n")
+            self._basic_emit(f"  Speed: {tps:.1f} tok/s\n")
+
+    def _emit_logprobs(self, logprobs: dict | None) -> None:
+        """Render top-N token distribution from a choice['logprobs'] payload
+        into the basic log sink. No-op if logprobs is missing or empty."""
+        if not logprobs:
+            return
+        import math
+        tokens = logprobs.get("tokens") or []
+        token_logprobs = logprobs.get("token_logprobs") or []
+        top_list = logprobs.get("top_logprobs") or []
+        for i, chosen in enumerate(tokens):
+            top = top_list[i] if i < len(top_list) else None
+            chosen_lp = token_logprobs[i] if i < len(token_logprobs) else None
+            if chosen_lp is None:
+                # prompt-echo tokens have no sampled logprob; skip
+                continue
+            self._basic_log(f"step: chose {chosen!r} (logprob {chosen_lp:.2f})")
+            if not top:
+                continue
+            for tok, lp_val in sorted(top.items(), key=lambda x: -x[1]):
+                prob = math.exp(lp_val) * 100
+                marker = "*" if tok == chosen else " "
+                self._basic_emit(f"  {marker} {tok!r:<20} {lp_val:>7.2f}  {prob:>5.1f}%\n")
+
     def _require_logits_all(self, feature: str) -> bool:
         """Check logits_all and log an error if missing. Returns True if OK."""
         if self.model_config.logits_all:
@@ -162,8 +152,7 @@ class ModelRunner:
 
     def load(self):
         """Load model with visibility into the process."""
-        with _thread_log_lock:
-            _thread_log_map[threading.get_ident()] = self
+        register_thread_runner(self)
 
         self._basic_log(f"Loading from {self.model_config.model_path}")
         self._visibility.log_loading(self.model_config, label=self.name)
@@ -171,17 +160,33 @@ class ModelRunner:
         start = time.time()
         kwargs = self.model_config.to_llama_kwargs(self.active_groups)
 
-        _router = _StdoutRouter(self._output_callback)
-        if kwargs.get("verbose", False):
-            # verbose=True: llama-cpp keeps the global callback installed.
-            with _redirect_stdout(_router), _redirect_stderr(_router):
-                self.llm = Llama(**kwargs)
-        else:
-            # verbose=False: Llama() calls llama_log_set(NULL) internally;
-            # reinstall the global callback so errors/warnings still surface.
-            with _redirect_stdout(_router), _redirect_stderr(_router):
-                self.llm = Llama(**kwargs)
-            llama_cpp.llama_log_set(_global_llama_log_cb, ctypes.c_void_p(0))
+        # Log category toggles are consumed by the log callback / fd capture;
+        # they are not arguments to Llama().
+        for _k in LOG_CATEGORY_FIELDS:
+            kwargs.pop(_k, None)
+
+        # --- Multimodal vision projector ---
+        mmproj_path = kwargs.pop("chat_handler_path", None)
+        self._has_vision = False
+        if mmproj_path and os.path.isfile(mmproj_path):
+            from llama_cpp.llama_chat_format import Llava15ChatHandler
+            self._basic_log(f"Loading vision projector: {mmproj_path}")
+            handler = Llava15ChatHandler(
+                clip_model_path=mmproj_path,
+                verbose=kwargs.get("verbose", False),
+            )
+            kwargs["chat_handler"] = handler
+            self._has_vision = True
+        elif mmproj_path:
+            self._log(f"WARNING: mmproj not found: {mmproj_path}")
+
+        _router = StdoutRouter(self._output_callback)
+        with FdStderrCapture(self), _redirect_stdout(_router), _redirect_stderr(_router):
+            self.llm = Llama(**kwargs)
+        # Llama() calls llama_log_set(NULL) when verbose=False; reinstall our
+        # global callback so errors/warnings and category-filtered logs keep flowing.
+        if not kwargs.get("verbose", False):
+            reinstall_log_callback()
 
         load_time = time.time() - start
         self._emit('\n')
@@ -189,7 +194,8 @@ class ModelRunner:
 
     def generate(self, prompt: str,
                  gen_config: GenerationConfig | None = None,
-                 history: list[dict] | None = None):
+                 history: list[dict] | None = None,
+                 images: list[str] | None = None):
         """Generate with full visibility based on active parameter groups."""
         if gen_config is None:
             gen_config = GenerationConfig()
@@ -251,7 +257,18 @@ class ModelRunner:
                           f"({len(prompt_tokens)}/{n_ctx} tokens). "
                           f"Consider reducing max_history_turns.")
 
+        # Filter valid images
+        valid_images = []
+        if images and self._has_vision:
+            for img_path in images:
+                if os.path.isfile(img_path):
+                    valid_images.append(img_path)
+                else:
+                    self._basic_log(f"WARNING: image not found, skipping: {img_path}")
+
         if beam_width > 1:
+            if valid_images:
+                self._log("WARNING: beam search does not support images, ignoring attachments.")
             max_tokens = kwargs.pop("max_tokens", 256)
             return self._generate_beam(
                 prompt, beam_width, length_penalty,
@@ -260,10 +277,22 @@ class ModelRunner:
                 stop=kwargs.pop("stop", None),
             )
         elif branch_at > 0:
+            if valid_images:
+                self._log("WARNING: branch-at-step does not support images, ignoring attachments.")
             return self._generate_branch(
                 prompt, branch_at, branch_pick,
                 max_tokens=kwargs.pop("max_tokens", 256),
                 stop=kwargs.pop("stop", None),
+            )
+
+        # --- Vision path: use create_chat_completion with image content ---
+        if valid_images:
+            return self._generate_vision(
+                prompt, valid_images, kwargs,
+                system_prompt=system_prompt,
+                history=history if use_history else None,
+                max_history_turns=max_history_turns,
+                do_stream=do_stream, show_stats=show_stats,
             )
 
         # Tokenize for stats
@@ -274,19 +303,127 @@ class ModelRunner:
         generated_tokens = 0
         full_response = ""
 
-        _router = _StdoutRouter(self._output_callback)
+        _router = StdoutRouter(self._output_callback)
         if do_stream:
-            with _redirect_stdout(_router), _redirect_stderr(_router):
+            with FdStderrCapture(self), _redirect_stdout(_router), _redirect_stderr(_router):
                 for chunk in self.llm(prompt, stream=True, echo=do_echo, **kwargs):
-                    token_text = chunk["choices"][0]["text"]
+                    choice = chunk["choices"][0]
+                    token_text = choice["text"]
                     full_response += token_text
                     generated_tokens += 1
                     self._emit(token_text)
+                    self._emit_logprobs(choice.get("logprobs"))
         else:
-            with _redirect_stdout(_router), _redirect_stderr(_router):
+            with FdStderrCapture(self), _redirect_stdout(_router), _redirect_stderr(_router):
                 result = self.llm(prompt, echo=do_echo, **kwargs)
             full_response = result["choices"][0]["text"]
             generated_tokens = result["usage"]["completion_tokens"]
+            self._emit(full_response)
+            self._emit_logprobs(result["choices"][0].get("logprobs"))
+
+        if not full_response.endswith('\n'):
+            self._emit('\n')
+
+        elapsed = time.time() - start
+        tps = generated_tokens / elapsed if elapsed > 0 else 0
+
+        self._emit_stats(generated_tokens, elapsed, show_stats)
+
+        self.stats = {
+            "input_tokens": len(tokens),
+            "output_tokens": generated_tokens,
+            "time": elapsed,
+            "tokens_per_second": tps,
+        }
+
+        return full_response
+
+    # ---- Vision / multimodal generation ----
+
+    _MIME_MAP = {
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".bmp": "image/bmp", ".webp": "image/webp",
+    }
+
+    def _generate_vision(self, prompt: str, image_paths: list[str],
+                         gen_kwargs: dict, *, system_prompt: str = "",
+                         history: list[dict] | None = None,
+                         max_history_turns: int = 10,
+                         do_stream: bool = False,
+                         show_stats: str = "always") -> str:
+        """Generate using create_chat_completion with image content blocks."""
+        import base64
+        from chat_format import _extract_text
+
+        self._basic_log(f"Vision generation: {len(image_paths)} image(s)")
+
+        # Build current user content with images
+        content: list[dict] = [{"type": "text", "text": prompt}]
+        for img_path in image_paths:
+            ext = os.path.splitext(img_path)[1].lower()
+            mime = self._MIME_MAP.get(ext, "image/png")
+            with open(img_path, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode()
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+
+        # Build messages list
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        if history:
+            trimmed = trim_history(history, max_history_turns)
+            for turn in trimmed:
+                turn_content = turn["content"]
+                if isinstance(turn_content, list):
+                    # Re-encode images from path references in history
+                    rebuilt: list[dict] = []
+                    for block in turn_content:
+                        if block.get("type") == "image_path":
+                            path = block["path"]
+                            if not os.path.isfile(path):
+                                self._basic_log(f"WARNING: history image missing: {path}")
+                                continue
+                            ext = os.path.splitext(path)[1].lower()
+                            mime = self._MIME_MAP.get(ext, "image/png")
+                            with open(path, "rb") as f:
+                                b64 = base64.b64encode(f.read()).decode()
+                            rebuilt.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{mime};base64,{b64}"},
+                            })
+                        else:
+                            rebuilt.append(block)
+                    messages.append({"role": turn["role"], "content": rebuilt})
+                else:
+                    messages.append({"role": turn["role"], "content": turn_content})
+        messages.append({"role": "user", "content": content})
+
+        start = time.time()
+        generated_tokens = 0
+        full_response = ""
+
+        _router = StdoutRouter(self._output_callback)
+        if do_stream:
+            with FdStderrCapture(self), _redirect_stdout(_router), _redirect_stderr(_router):
+                for chunk in self.llm.create_chat_completion(
+                    messages=messages, stream=True, **gen_kwargs,
+                ):
+                    delta = chunk["choices"][0].get("delta", {})
+                    token_text = delta.get("content", "")
+                    if token_text:
+                        full_response += token_text
+                        generated_tokens += 1
+                        self._emit(token_text)
+        else:
+            with FdStderrCapture(self), _redirect_stdout(_router), _redirect_stderr(_router):
+                result = self.llm.create_chat_completion(
+                    messages=messages, **gen_kwargs,
+                )
+            full_response = result["choices"][0]["message"]["content"] or ""
+            generated_tokens = result.get("usage", {}).get("completion_tokens", 0)
             self._emit(full_response)
 
         if not full_response.endswith('\n'):
@@ -295,21 +432,9 @@ class ModelRunner:
         elapsed = time.time() - start
         tps = generated_tokens / elapsed if elapsed > 0 else 0
 
-        if show_stats == "always":
-            self._emit(f"{'-'*40}\n")
-            self._log("STATS:")
-            self._emit(f"  Output tokens: {generated_tokens}\n")
-            self._emit(f"  Time: {elapsed:.2f}s\n")
-            self._emit(f"  Speed: {tps:.1f} tok/s\n")
-        elif show_stats == "basic":
-            self._basic_emit(f"{'-'*40}\n")
-            self._basic_log("STATS:")
-            self._basic_emit(f"  Output tokens: {generated_tokens}\n")
-            self._basic_emit(f"  Time: {elapsed:.2f}s\n")
-            self._basic_emit(f"  Speed: {tps:.1f} tok/s\n")
+        self._emit_stats(generated_tokens, elapsed, show_stats)
 
         self.stats = {
-            "input_tokens": len(tokens),
             "output_tokens": generated_tokens,
             "time": elapsed,
             "tokens_per_second": tps,
@@ -570,8 +695,7 @@ class ModelRunner:
             del self.llm
             self.llm = None
             self._basic_log("Unloaded")
-        with _thread_log_lock:
-            _thread_log_map.pop(threading.get_ident(), None)
+        unregister_thread_runner()
 
 
 # ---- Service layer ----
@@ -650,7 +774,8 @@ class RunnerService:
 
     def submit_prompt(self, prompt: str,
                       gen_config: GenerationConfig | None = None,
-                      history: list[dict] | None = None):
+                      history: list[dict] | None = None,
+                      images: list[str] | None = None):
         if self.state != ServiceState.READY:
             self._output_callback(
                 f"<basic_log>[service] Cannot submit: state is {self.state.value}\n</basic_log>"
@@ -660,6 +785,7 @@ class RunnerService:
             "prompt": prompt,
             "gen_config": gen_config or self._config.generation_config,
             "history": history or [],
+            "images": images or [],
         })
 
     def _run_loop(self):
@@ -684,6 +810,7 @@ class RunnerService:
                         prompt=item["prompt"],
                         gen_config=item["gen_config"],
                         history=item.get("history", []),
+                        images=item.get("images", []),
                     )
                     if self._completion_callback and response is not None:
                         self._completion_callback(response)

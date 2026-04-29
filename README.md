@@ -20,6 +20,9 @@ A multithreaded local LLM runner built for deep visibility into model behavior, 
 - **Branch-at-step** — force an alternate token at any specific generation step to explore different continuations from the same context
 - **Logit visibility** — step-by-step generation mode that shows the top-5 candidate tokens and their log-probabilities at each position
 - **Three-tier log output** — switch between Output (tokens only), Basic Logs (parameter summaries, stats, beam progress), and Verbose Logs (raw llama.cpp C-level messages)
+- **Per-category log filters** — toggle individual llama.cpp log categories (backend, model_load, perf_stats, decode, image_progress, prompt_debug, tensor_debug) independently of the three-tier view
+- **Multimodal vision** — attach images to prompts for mmproj-equipped models via the `+` button, drag-and-drop, clipboard paste (Ctrl+V), or inline file paths; a thumbnail strip previews pending attachments
+- **Multi-line prompt input** — Enter sends, Shift+Enter inserts a newline; the input auto-grows up to 4 lines then scrolls
 - **Module system** — drop a `.py` file into `modules/` and it auto-loads on startup with access to agent output, user input, and the prompt routing API
 
 ---
@@ -62,6 +65,11 @@ Models included in the script:
 | Qwen2.5-7B | Q8_0 | ~7.7 GB |
 | Qwen2.5-7B | Q4_K_M | ~4.4 GB |
 | GLM-4.7-Flash | Q8_0 | ~31.8 GB |
+| Gemma 4 31B Instruct | Q4_K_M | ~18.3 GB |
+| Gemma 4 31B Instruct | Q8_0 | ~32.6 GB |
+| Gemma 4 31B mmproj (vision) | F16 | vision projector |
+| Gemma 4 E4B Instruct | Q8_0 | ~4B effective params |
+| Gemma 4 E4B mmproj (vision) | F16 | vision projector |
 
 You can also drop any `.gguf` file into `models/` manually — it will be discovered automatically.
 
@@ -93,7 +101,8 @@ The window is divided into three main areas:
 │  [name][st]  │         output console                   │
 │              │                                          │
 │ [Add][Load]  │  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄    │
-│ [Unload][Save│  [ prompt input                  ][Send] │
+│              │  [img][img]  (thumbnails, when attached)  │
+│ [Unload][Save│  [+][ prompt input (Shift+Enter) ][Send]  │
 └──────────────┼──────────────────────────────────────────┤
                │  Parameters (scrollable)                 │
                │  [group toggles]                         │
@@ -118,7 +127,7 @@ The window is divided into three main areas:
 
 Output text is tagged at the source using XML-style markers (`<basic_log>`, `<llama_cpp>`) and parsed on the UI side to apply per-mode filtering and coloring.
 
-*See: `core/src/ui/constants.py` — `_COMBINED_RE`, `_parse_segment()`; `core/src/ui/main_window.py` — `MainWindow._render_segments()`; `core/src/runner.py` — `_make_llama_log_cb()`*
+*See: `core/src/ui/constants.py` — `_COMBINED_RE`, `_parse_segment()`; `core/src/ui/main_window.py` — `MainWindow._render_segments()`; `core/src/llama_logs.py` — `_global_llama_log_cb`, `FdStderrCapture`*
 
 **Parameter panel** — shows all parameters for the currently selected agent, grouped by visibility group. Loading parameters (those that require a model restart to take effect) are marked with an orange `*` and a `⟳ restart` warning when their live value diverges from the value the model was loaded with.
 
@@ -195,10 +204,11 @@ Every parameter belongs to exactly one named group. Disabled groups are complete
 | `constraints` | `grammar` (GBNF), `logit_bias` |
 | `context_extension` | RoPE base/scale, YaRN parameters |
 | `adapters` | `lora_path`, `lora_base`, `lora_scale` |
-| `visibility` | `verbose`, `logits_all`, `seed`, `logprobs`, `stream`, `echo` |
+| `visibility` | `verbose`, `logits_all`, `seed`, `logprobs`, `stream`, `echo`, `show_stats`, `log_backend`, `log_model_load`, `log_perf_stats`, `log_decode`, `log_image_progress`, `log_prompt_debug`, `log_tensor_debug` |
 | `multi_gpu` | `tensor_split`, `main_gpu`, `split_mode` |
 | `speculative` | `draft_model` |
 | `beam_search` | `beam_width`, `beam_depth`, `length_penalty`, `beam_log_tree`, `beam_top_results`, `branch_at`, `branch_pick` |
+| `multimodal` | `chat_handler_path` (path to an mmproj vision projector `.gguf`) |
 
 Group changes applied in the parameter panel take effect on the next prompt; loading parameters (marked `*`) take effect on the next **Load**.
 
@@ -245,6 +255,14 @@ Requires `logits_all=true`.
 A lower-level generation mode that steps through tokens one at a time and logs the top-5 candidates and their raw scores at each position.
 
 *See: `core/src/runner.py` — `ModelRunner.generate_with_logits()`*
+
+### Vision generation
+
+When the `multimodal` group is enabled and `chat_handler_path` points to an mmproj `.gguf`, any images attached to a prompt (via the `+` button, drag-and-drop, clipboard paste, or an inline file path in the message) are sent through `Llama.create_chat_completion` with image content blocks. History images are re-encoded from their stored paths on each turn. Beam search and branch-at-step do not support images and will ignore attachments with a warning.
+
+Pasted clipboard images are saved to `agents/<slug>/sessions/images/` as timestamped PNGs so they survive the conversation.
+
+*See: `core/src/runner.py` — `ModelRunner._generate_vision()`; `core/src/llama_logs.py` — `FdStderrCapture`*
 
 ---
 
@@ -317,6 +335,7 @@ ClearHelm/
 ├── core/src/
 │   ├── params.py           # Configuration dataclasses + parameter group definitions
 │   ├── runner.py           # ModelRunner (inference) + RunnerService (threaded wrapper)
+│   ├── llama_logs.py       # llama.cpp log callback + fd-level stderr capture (mtmd)
 │   ├── manager.py          # ModelManager (multi-agent orchestration)
 │   ├── module_manager.py   # Module plugin system
 │   └── ui/
@@ -334,6 +353,7 @@ ClearHelm/
 │   └── <slug>/
 │       ├── config.json     # Agent configuration
 │       └── sessions/       # Chat history files
+│           └── images/     # Pasted clipboard images (timestamped PNGs)
 ├── configs/                # Config presets
 │   ├── default.json
 │   ├── fullvis.json

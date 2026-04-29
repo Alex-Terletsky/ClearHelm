@@ -1,12 +1,44 @@
 import os
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPixmap, QGuiApplication
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QDialogButtonBox,
 )
 
 from .widgets import NoScrollComboBox
+
+
+class ImagePreviewDialog(QDialog):
+    """Full-size preview of an attached image. Click or Esc to close."""
+
+    def __init__(self, image_path: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(os.path.basename(image_path))
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        pix = QPixmap(image_path)
+        if pix.isNull():
+            label.setText(f"(failed to load: {image_path})")
+        else:
+            screen = self.screen() or QGuiApplication.primaryScreen()
+            avail = screen.availableGeometry()
+            max_w = int(avail.width() * 0.85)
+            max_h = int(avail.height() * 0.85)
+            if pix.width() > max_w or pix.height() > max_h:
+                pix = pix.scaled(max_w, max_h, Qt.KeepAspectRatio,
+                                 Qt.SmoothTransformation)
+            label.setPixmap(pix)
+        layout.addWidget(label)
+
+    def mousePressEvent(self, event):
+        self.close()
 
 
 class AddAgentDialog(QDialog):

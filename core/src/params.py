@@ -78,7 +78,9 @@ PARAMETER_GROUPS = {
     },
     "visibility": {
         "description": "Debug and transparency options",
-        "loading": ["verbose", "logits_all", "seed"],
+        "loading": ["verbose", "logits_all", "seed",
+                    "log_image_progress", "log_prompt_debug", "log_tensor_debug",
+                    "log_backend", "log_model_load", "log_perf_stats", "log_decode"],
         "generation": ["logprobs", "stream", "echo", "show_stats"],
     },
     "multi_gpu": {
@@ -109,6 +111,11 @@ PARAMETER_GROUPS = {
         "description": "Chat session loading behavior",
         "loading": [],
         "generation": ["session_mode", "session_file"],
+    },
+    "multimodal": {
+        "description": "Vision / multimodal projector",
+        "loading": ["chat_handler_path"],
+        "generation": [],
     },
 }
 
@@ -142,10 +149,18 @@ PARAM_META: dict[str, dict] = {
     "lora_scale":       {"description": "LoRA adapter strength", "min": 0.0, "step": 0.1, "decimals": 2},
     "verbose":          {"description": "Print llama.cpp loading/inference logs"},
     "seed":             {"description": "RNG seed (-1 = random)"},
+    "log_image_progress": {"description": "Show image encode/decode progress and timing in basic logs"},
+    "log_prompt_debug":   {"description": "Show prompt template dumps during vision generation (verbose logs)"},
+    "log_tensor_debug":   {"description": "Show internal tensor/batch state during image tokenization (verbose logs)"},
+    "log_backend":        {"description": "Show GPU/backend device init (ggml/cuda/vulkan) in basic logs"},
+    "log_model_load":     {"description": "Show model loader, metadata, and context init (verbose logs)"},
+    "log_perf_stats":     {"description": "Show end-of-generation llama_perf timing in basic logs"},
+    "log_decode":         {"description": "Show per-token decode/eval/sampler logs (verbose, very noisy)"},
     "tensor_split":     {"description": "Fraction of model to put on each GPU"},
     "main_gpu":         {"description": "GPU used for scratch and small tensors", "min": 0},
     "split_mode":       {"description": "How to split across GPUs (1 = layer, 2 = row)", "min": 0, "max": 2},
     "draft_model":      {"description": "Smaller draft model for speculative decoding"},
+    "chat_handler_path": {"description": "Path to multimodal vision projector (mmproj) GGUF file"},
     # GenerationConfig
     "max_tokens":       {"description": "Maximum tokens to generate", "min": 1},
     "temperature":      {"description": "Randomness (0 = deterministic, higher = more random)", "min": 0.0, "step": 0.05, "decimals": 2},
@@ -275,6 +290,15 @@ class ModelConfig:
     verbose: bool = False
     seed: int = -1
 
+    # --- Log category filters (runtime; popped from Llama() kwargs) ---
+    log_image_progress: bool = True
+    log_prompt_debug:   bool = False
+    log_tensor_debug:   bool = False
+    log_backend:        bool = True
+    log_model_load:     bool = False
+    log_perf_stats:     bool = True
+    log_decode:         bool = False
+
     # --- Multi-GPU ---
     tensor_split: list | None = None
     main_gpu: int = 0
@@ -282,6 +306,9 @@ class ModelConfig:
 
     # --- Speculative ---
     draft_model: object | None = None
+
+    # --- Multimodal ---
+    chat_handler_path: str | None = None
 
     def to_llama_kwargs(self, active_groups: list[str]) -> dict:
         """Build kwargs dict filtered by *active_groups*.
@@ -369,6 +396,11 @@ class GenerationConfig:
         # logprobs=0 is meaningless and requires logits_all=True; treat it as unset.
         if not kwargs.get('logprobs'):
             kwargs.pop('logprobs', None)
+        # GBNF grammars are authored as strings in JSON configs; llama-cpp-python
+        # expects a LlamaGrammar object at call time.
+        if isinstance(kwargs.get('grammar'), str):
+            from llama_cpp import LlamaGrammar
+            kwargs['grammar'] = LlamaGrammar.from_string(kwargs['grammar'])
         return kwargs
 
     def get_visible_params(self, active_groups: list[str]) -> dict[str, dict]:
